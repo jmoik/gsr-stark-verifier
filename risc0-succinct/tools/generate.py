@@ -17,7 +17,7 @@ import struct
 from pathlib import Path
 
 import babybear as bb
-import compress
+import gsr_tooling
 import packed as pk
 import reference as ref
 import witness as wit
@@ -880,7 +880,7 @@ class Gen:
         main.code = bytearray(renumber_calls(bytes(head.code + m.s.code), index))
         script = Script().extend(decls).extend(main)
         info = {"functions": {fid: sizes[fid] for fid in self.used}, "decl_len": len(decls.code),
-                # main-script byte range holding the head and the statement prologue (see compress.protect)
+                # main-script byte range holding the head and the statement prologue (see gsr_tooling.compress)
                 "head_prologue": (0, len(head.code) + prologue_len),
                 "query_body_bytes": len(body.code), "persist": len(persist), "accesses": m.accesses,
                 "pool": f.pool_candidates()}
@@ -932,7 +932,7 @@ def main() -> None:
     first = gen.generate()[1]
     script, info = gen.generate(first["accesses"], first["pool"])
     if args.compress:
-        code, info["compression"] = compress.compress(bytes(script.code))
+        code, info["compression"] = gsr_tooling.compress(bytes(script.code))
         script = Script()
         script.code = bytearray(code)
     info["pooled"] = len(info.pop("pool"))

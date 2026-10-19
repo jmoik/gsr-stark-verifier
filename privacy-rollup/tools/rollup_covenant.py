@@ -24,8 +24,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "risc0-succinct/tools"))
 sys.path.insert(0, str(REPO / "recursive-stwo/tools"))
-import compress  # noqa: E402
 import generate as g  # noqa: E402
+import gsr_tooling  # noqa: E402
 import reference as ref  # noqa: E402
 from gsr import Asm, Script, V, assemble, op_success_offsets  # noqa: E402
 from transaction import NUMS  # noqa: E402
@@ -134,7 +134,7 @@ class Covenant:
             if compressed:
                 # The head (root push) and the prologue (which embeds the root's offset) are never merged into
                 # macros, so the root stays first in the main script and every root shares the declarations.
-                code, info["compression"] = compress.compress(code, protect=info["head_prologue"])
+                code, info["compression"] = gsr_tooling.compress(code, protect=info["head_prologue"])
                 info["decl_len"] = info["compression"]["decl_len"]
             return code, info
 

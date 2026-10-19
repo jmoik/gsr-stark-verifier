@@ -16,9 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import compress
 import differential as d
 import generate as g
+import gsr_tooling
 import measure
 import reference as ref
 from transaction import NUMS  # noqa: E402  (measure puts recursive-stwo/tools on sys.path)
@@ -53,7 +53,7 @@ class Covenant:
         self.script = bytes(script.code)
         self.compression = None
         if compressed:
-            self.script, self.compression = compress.compress(self.script)
+            self.script, self.compression = gsr_tooling.compress(self.script)
         self.functions = info["functions"]
         self.taproot = taproot_construct(NUMS, [("verifier", CScript(self.script), LEAF)])
         self.hints = g.prover_hints(self.gen, receipt, seal)
