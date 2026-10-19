@@ -17,26 +17,34 @@ The OP_TX selector format (six bytes, versioned) is unchanged.
 
 | | `gsr-full` (cited) | `gsr` | `gsr`, compressed |
 |---|---:|---:|---:|
-| RISC Zero verifier script, fixed statement | 158,572 B | 160,600 B | 91,550 B |
-| Covenant spend with the committed receipt | 388,641 WU | 390,661 WU | **321,301 WU** |
-| Rollup settlement leaf | 159,265 B | 161,252 B | 92,023 B |
-| Rollup settlement, one join-split | 392,001 WU | ≈ 394,000 WU (est.) | ≈ 324,800 WU (est.) |
+| RISC Zero verifier script, fixed statement | 158,572 B | 160,600 B | 77,321 B |
+| Covenant spend with the committed receipt | 388,641 WU | 390,661 WU | **306,964 WU** |
+| Rollup settlement leaf | 159,265 B | 161,252 B | 77,684 B |
+| Rollup settlement, one join-split | 392,001 WU | ≈ 394,000 WU (est.) | ≈ 310,400 WU (est.) |
 
 - **Port (+2 kB).** Expanding `OP_MULTI` costs about 2 kB (mostly `<6> OP_MULTI OP_ADD` at 514 sites); macro
   declarations and calls are slightly smaller than `OP_DEFINE`/`OP_INVOKE`. The uncompressed verifier is
   byte-identical to the gsr-full script converted by an independent converter whose output was mined on gsr-net.
-- **Compression (−69 kB).** About three quarters of the main script is stack routing (depth pushes, `PICK`, `ROLL`)
-  in short patterns that recur hundreds of times. `gsr compress` from
-  [gsr-tooling](https://github.com/bitcoin-gsr/gsr-tooling), pinned in `risc0-succinct/tools/gsr_tooling.py`, moves
-  them into nested macros; the unrolled script (3,361,215 B, 84% of the 4 MB limit) is unchanged. Varops rise by the
-  unrolling charge (1.767B → 1.829B for the fixed statement), about 57% of the budget.
+- **Compression (−83 kB).** About three quarters of the main script is stack routing (depth pushes, `PICK`, `ROLL`)
+  in short patterns that recur hundreds of times, but a depth operand repeats only when the same value is at the
+  same depth. `gsr anchor` from [gsr-tooling](https://github.com/bitcoin-gsr/gsr-tooling) therefore rewrites reads
+  320 or more deep to address the value from the stack bottom (`DEPTH <i+1> SUB PICK|ROLL`), which stays the same
+  while the value stays put; the script grows by 17 kB, and `gsr compress` moves the repeats into about 670 nested
+  macros. Both are pinned in `risc0-succinct/tools/gsr_tooling.py`. The unrolled script (3,378,159 B, 84% of the
+  4 MB limit) is the anchored one. Varops rise from 1.767B to 1.851B for the fixed statement (60% of the budget):
+  20M for `DEPTH`/`SUB`, the rest unrolling charge. Uncompressed scripts are left as generated.
 - **Same verifier.** `gsr compress` returns only scripts that unroll byte for byte to its input, and under the
   reusable-macros BIP a script and its unrolled form give the same result except for what reads the script bytes,
   the budget and the unrolling charge. `gsr_tooling.compress` also rejects any result in which `gsr check` finds a
   consensus error, such as an OP_SUCCESSx or a malformed macro; the compressed verifiers have none, nor warnings
   or lints. The verifiers read nothing that depends on their script bytes (the covenant's only `OP_TX` reads the
   outputs). The rollup leaf reads its own script to splice in the next root, so its root push and prologue stay
-  literal (`gsr compress --protect`) and its splice offsets add the declarations' length.
+  literal (`gsr compress --protect`) and its splice offsets add the declarations' length. `gsr anchor` rewrites only
+  when it proves that a single witness item count can succeed (762 for the fixed and covenant verifiers, 763 for the
+  rollup leaf): with that count the anchored reads see the same values, and with any other count the script fails
+  either way, possibly with a different error. `risc0-succinct/tools/differential.py --compress` runs the deployed
+  form against RISC Zero's native verifier and the Python reference: all three accept the valid receipt, and the
+  Script rejects all 34 negative cases, including surplus, missing and empty witness items.
 - **Real proof.** The covenant receipt's journal is the spending transaction's outputs, so it needs no re-proving:
   both the plain and the compressed spend are accepted under standard policy and mined; the same spend paying 1 sat
   less is rejected.
@@ -52,7 +60,7 @@ unchanged. A full batch of 8 join-splits (≈ 410k WU before, estimated) should 
 ```sh
 bash recursive-stwo/tools/build.sh                     # node, cli, util at ad6c16f
 cargo install --locked --git https://github.com/bitcoin-gsr/gsr-tooling \
-  --rev 04cda8374cef2ad05d9f90c67d7eb8e52ee47ba1       # gsr, for --compress and the covenants
+  --rev b1f8dcfac05f9eebfbc8418ca58f73f6fc10244f       # gsr, for --compress and the covenants
 python3 risc0-succinct/tools/generate.py [--compress]  # fixed-statement verifier
 python3 -c 'import sys; sys.path.insert(0, "risc0-succinct/tools"); import json, covenant as c; \
   r = json.loads((c.ROOT / "fixtures/covenant-receipt.json").read_text()); \

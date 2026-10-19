@@ -5,7 +5,10 @@ The valid padded-SHA fixture must be accepted by all three -- the Script inside 
 the pinned Core interpreter -- and must produce the same intermediate values natively and in the reference. Every
 negative case must be rejected by all three.
 
-    python3 differential.py [--quick]     # --quick: standalone evalscript instead of the full transaction meter
+    python3 differential.py [--quick] [--compress]
+
+--quick uses standalone evalscript instead of the full transaction meter; --compress tests the deployed compressed
+form (`gsr_tooling.compress`: `gsr anchor`, then `gsr compress`) instead of the plain script.
 """
 import argparse
 import copy
@@ -21,6 +24,7 @@ from typing import Callable
 
 import babybear as bb
 import generate as g
+import gsr_tooling
 import measure
 import reference as ref
 import run
@@ -28,6 +32,7 @@ from babybear import P
 
 ROOT = Path(__file__).resolve().parents[1]
 RISC0 = Path(os.environ.get("RISC0_DIR", Path.home() / "risc0"))
+COMPRESS = False  # --compress
 BUILD = ROOT / "build/test"
 
 
@@ -111,7 +116,10 @@ def bundle_for(receipt: dict, witness: list[bytes], cache: dict) -> dict:
     if key not in cache:
         gen = g.Gen(st, ref.load_circuit())
         first = gen.generate()[1]
-        cache[key] = (gen.generate(first["accesses"], first["pool"])[0].code.hex(), first["functions"])
+        code = bytes(gen.generate(first["accesses"], first["pool"])[0].code)
+        if COMPRESS:
+            code = gsr_tooling.compress(code)[0]
+        cache[key] = (code.hex(), first["functions"])
     code, functions = cache[key]
     return {"script": code, "witness": [w.hex() for w in witness], "info": {"functions": functions}}
 
@@ -126,7 +134,10 @@ def flip(seal: bytes, word: int, value: Callable[[int], int] | None = None) -> b
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--compress", action="store_true")
     args = ap.parse_args()
+    global COMPRESS
+    COMPRESS = args.compress
     receipt = json.loads((ROOT / "fixtures/receipt.json").read_text())
     seal = (ROOT / "fixtures/seal.bin").read_bytes()
     gen = g.Gen(g.Statement(receipt), ref.load_circuit())
