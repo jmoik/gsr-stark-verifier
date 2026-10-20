@@ -498,19 +498,15 @@ class Gen:
         for _ in range(6):
             xp.append(f.reduce(f.mul(xp[-1], x)))
 
-        hints = a.roll(items["hints"])
-        self.size_check(a, hints, 16 * (CHECK_COMBO + 1))
-        self.range_check(a, hints, pv["masks"])
-        qv = []
-        for c in range(CHECK_COMBO + 1):
-            a.pick(hints)
-            a.push(16 * c)
-            a.push(16)
-            a.op("SUBSTR", 3, V())
-            qv.append(f.fn(FN_SPREAD, pk.spread_ops(), 1, V("q", 1 << 32, True)))
-        a.drop(hints)
+        hint = a.roll(items["hints"])
+        self.size_check(a, hint, 16)
+        self.range_check(a, hint, pv["masks"])
+        a.roll(hint)
+        inv = f.fn(FN_SPREAD, pk.spread_ops(), 1, V("inv", 1 << 32, True))
 
-        # q_c * D_c(x) == tot_c - U_c(x)
+        # goal = sum_c (tot_c - U_c(x)) / D_c(x) = num / den with num = sum_c (tot_c - U_c) prod_{j != c} D_j and
+        # den = prod_c D_c; the hint is 1 / den
+        num = den = None
         for c in range(CHECK_COMBO + 1):
             dco = pv["dcoef"][c]
             n = len(dco)
@@ -524,14 +520,15 @@ class Gen:
             for k in range(1, len(cu)):
                 terms.append(f.mul(cu[k], xp[k]))
             u = f.sum(terms)
-            e = f.mul(qv[c], d, cy=True)
-            e = f.add(e, u, True, True)
-            e = f.sub(e, tot[c], True, True)
-            f.canon(e)
-            a.raw(assemble([0, "NUMEQUAL", "VERIFY"]), 1)
-        for v in qv:
-            a.roll(v)
-        goal = f.reduce(f.sum(qv))
+            n = f.sub(tot[c], u, True, True)
+            if num is None:
+                num, den = n, d
+            else:
+                num = f.add(f.mul(num, d, True), f.mul(n, den, True), True, True)
+                den = f.mul(den, d, True, True)
+        f.canon(f.mul(den, inv, True))
+        a.raw(assemble([1, "NUMEQUAL", "VERIFY"]), 1)
+        goal = f.reduce(f.mul(num, inv, True, True))
 
         # FRI rounds
         for r in range(FRI_ROUNDS):
