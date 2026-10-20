@@ -42,10 +42,35 @@ class Field:
         self.pool: dict[int, V] = {}
         serial = V.serial
         for i, value in enumerate(pool or []):
-            v = a.push(value, V("pool", 1))
+            v = self.build(value)
             v.sid = -1 - i
             self.pool[value] = v
         V.serial = serial
+
+    def build(self, value: int) -> V:
+        """Push a pool constant. Packed constants whose upper lanes repeat, (c + k, k, k, k), are built from an
+        earlier (k, k, k, k) as `+ c`, from an earlier (m, m, m, m) with k = m << s as `<< s`, or from k by copying
+        it into the upper lanes."""
+        lanes = pk.unpack(value)
+        k, c = lanes[1], lanes[0] - lanes[1]
+        if value >= 1 << 4 * pk.W or not k or lanes[1:] != [k] * 3 or c < 0:
+            return self.a.push(value, V("pool", 1))
+        spread = pk.pack([k] * 4)
+        if c:
+            if spread not in self.pool:
+                return self.a.push(value, V("pool", 1))
+            self.a.pick(self.pool[spread])
+            self.a.push(c)
+            return self.a.op("ADD", 2, V("pool", 1)).top()
+        for m, v in self.pool.items():
+            m0 = pk.unpack(m)[0]
+            if m == pk.pack([m0] * 4) and k > m0 and k == m0 << (k.bit_length() - m0.bit_length()):
+                self.a.pick(v)
+                self.a.push(k.bit_length() - m0.bit_length())
+                return self.a.op("LSHIFT", 2, V("pool", 1)).top()
+        self.a.push(k)
+        return self.a.raw(assemble(["DUP", pk.W, "LSHIFT", "OR", "DUP", 2 * pk.W, "LSHIFT", "OR"]), 1,
+                          V("pool", 1)).top()
 
     def pooled(self, value: int, v: V) -> V:
         self.counts[value] = self.counts.get(value, 0) + 1
@@ -114,6 +139,7 @@ class Field:
     def add(self, x, y, cx: bool = False, cy: bool = False) -> V:
         a = self.operand(x, cx, ADD_LIMIT)
         b = self.operand(y, cy, ADD_LIMIT)
+        self.a.commute()
         return self.a.op("ADD", 2, V("+", a.bound + b.bound, a.ext or b.ext)).top()
 
     def sum(self, items: list[V]) -> V:
@@ -154,6 +180,7 @@ class Field:
         if is_ext(x) and is_ext(y):
             self.operand(x, cx, pk.MUL_IN_BOUND)
             self.operand(y, cy, pk.MUL_IN_BOUND)
+            self.a.commute()
             return self.fn(FN_MUL, pk.ext_mul_ops(), 2, V("*", pk.REDUCED, True))
         bx, by = bound(x), bound(y)
         rx = ry = False
@@ -170,4 +197,5 @@ class Field:
         b = self.fetch(y, cy)
         if ry:
             b = self.reduce_top()
+        self.a.commute()
         return self.a.op("MUL", 2, V("*s", a.bound * b.bound, a.ext or b.ext)).top()

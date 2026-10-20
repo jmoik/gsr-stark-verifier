@@ -189,6 +189,7 @@ class Asm:
         # pass) the last pick of a value becomes a roll, so dead values leave the stack as soon as possible.
         self.accesses: dict[int, int] = {}
         self.plan, self.active = plan, True
+        self.swap_end = -1  # code length right after a SWAP that _roll emitted
 
     def access(self, v: V) -> bool:
         """Record an access; True when a planned pick is the value's last access."""
@@ -261,7 +262,12 @@ class Asm:
         if d == 0:
             return v
         if d == 1:
-            self.s.op("SWAP")
+            if self.swap_end == len(self.s.code):
+                del self.s.code[-1]  # SWAP SWAP
+                self.swap_end = -1
+            else:
+                self.s.op("SWAP")
+                self.swap_end = len(self.s.code)
         elif d == 2:
             self.s.op("ROT")
         else:
@@ -269,6 +275,13 @@ class Asm:
         del self.st[len(self.st) - 1 - d]
         self.st.append(v)
         return v
+
+    def commute(self) -> None:
+        """Before an operation that does not depend on the order of the top two values: drop a SWAP just emitted."""
+        if self.swap_end == len(self.s.code):
+            del self.s.code[-1]
+            self.st[-2:] = self.st[:-3:-1]
+            self.swap_end = -1
 
     def fetch(self, v: V, consume: bool) -> V:
         return self.roll(v) if consume else self.pick(v)

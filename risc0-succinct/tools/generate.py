@@ -274,8 +274,11 @@ class Gen:
     # ---- constraint evaluation (poly_ext), one straight-line block in the main script ----
     def poly_ext(self, f: Field, eval_u: list, out_vals: dict, mix: list[V], poly_mix: V) -> V:
         block = self.circuit["poly_ext"]["block"]
+        # fp entries are constants or `Lazy` cells; a cell's operation is emitted on its first use, so most
+        # intermediates are computed just before they are consumed and sit at the top of the stack.
         fp: list = []
-        mx: list = []
+        mx: list = []  # constraint chain steps; mx_len: the number of poly_mix powers each chain spans
+        mx_len: list[int] = []
         pows = {1: poly_mix}
 
         def powmix(e: int) -> V:
@@ -284,23 +287,82 @@ class Gen:
                 pows[e] = f.mul(powmix(h), powmix(e - h))
             return pows[e]
 
-        def prep(i: int, limit: int) -> None:
-            v = fp[i]
-            if isinstance(v, V) and v.bound > limit:
-                fp[i] = f.reduce(v, consume=False)
+        def val(x):
+            """Emit `x` and the operands it needs, depth first (iteratively: the chains are thousands deep)."""
+            if not isinstance(x, Lazy):
+                return x
+            todo = [x]
+            while todo:
+                c = todo[-1]
+                op, a, b = c.op if c.v is None else (None, None, None)
+                need = [d for d in ((b, a) if op == "Sub" else (a, b)) if isinstance(d, Lazy) and d.v is None]
+                if need:
+                    todo.append(need[0])
+                    continue
+                todo.pop()
+                if c.v is None:
+                    c.v = emit(op, a, b)
+            return x.v
 
-        def scaled(term, e: int):
-            """poly_mix^e * term."""
-            if e == 0:
-                return term
-            if isinstance(term, V) and term.ext and term.bound > pk.MUL_IN_BOUND:
-                term = f.reduce(term, consume=False)
-            return f.mul(powmix(e), term)
+        def prep(x, limit: int) -> None:
+            if isinstance(x, Lazy) and x.v.bound > limit:
+                x.v = f.reduce(x.v, consume=False)
 
-        def add_tot(tot, term):
-            if isinstance(tot, int) and tot == 0:
-                return term
-            return f.add(tot, term)
+        def emit(op: str, x, y) -> V:
+            if op == "Add":
+                return f.add(val(x), val(y))
+            if op == "Sub":
+                val(y)
+                return f.sub(val(x), val(y))
+            val(x), val(y)
+            if isinstance(x, Lazy) and isinstance(y, Lazy):
+                if x.v.ext and y.v.ext:
+                    prep(x, pk.MUL_IN_BOUND)
+                    prep(y, pk.MUL_IN_BOUND)
+                elif x.v.bound * y.v.bound >= 1 << 95:
+                    prep(x if x.v.bound >= y.v.bound else y, 1 << 35)
+            return f.mul(val(x), val(y))
+
+        def zero(x) -> bool:
+            return isinstance(x, int) and x == 0
+
+        def term_zero(item) -> bool:
+            if item[0] == "Eqz":
+                return zero(item[2])
+            k = item[3]
+            return zero(item[2]) or all(term_zero(mx[j]) for j in chain(k))
+
+        def chain(k: int) -> list[int]:
+            """The steps of the constraint chain ending at mx[k], last first."""
+            steps = []
+            while mx[k][0] != "True":
+                steps.append(k)
+                k = mx[k][1]
+            return steps
+
+        def horner(k: int):
+            """The chain's value, sum of c_i poly_mix^E_i, by Horner's rule from its last term: acc = c_i +
+            poly_mix^w_i acc, w_i = 1 for AndEqz and the inner chain's length for AndCond. Zero terms only raise the
+            pending exponent."""
+            acc, pend = 0, 0
+            for j in chain(k):
+                item = mx[j]
+                w = 1 if item[0] == "Eqz" else mx_len[item[3]]
+                if term_zero(item):
+                    pend += w
+                    continue
+                if not zero(acc):
+                    acc = f.mul(acc, powmix(pend + w))
+                if item[0] == "Eqz":
+                    c = val(item[2])
+                else:
+                    inner, cond = horner(item[3]), item[2]
+                    c = inner if (isinstance(cond, int) and cond == 1) else f.mul(val(cond), inner)
+                acc = c if zero(acc) else f.add(acc, c)
+                pend = 0
+            if not zero(acc) and pend:
+                acc = f.mul(acc, powmix(pend))
+            return acc
 
         for step in block:
             op = step[0]
@@ -309,55 +371,40 @@ class Gen:
             elif op == "ConstExt":
                 fp.append(norm(tuple(step[1:5])))
             elif op == "Get":
-                fp.append(eval_u[step[1]])
+                fp.append(Lazy(eval_u[step[1]]))
             elif op == "GetGlobal":
-                fp.append(out_vals[step[2]] if step[1] == 0 else mix[step[2]])
+                fp.append(Lazy(out_vals[step[2]] if step[1] == 0 else mix[step[2]]))
             elif op in ("Add", "Sub", "Mul"):
                 x, y = fp[step[1]], fp[step[2]]
-                cx, cy = not isinstance(x, V), not isinstance(y, V)
+                cx, cy = not isinstance(x, Lazy), not isinstance(y, Lazy)
                 if cx and cy:
                     fx, fy = bb_ext(x), bb_ext(y)
                     r = bb.add(fx, fy) if op == "Add" else bb.sub(fx, fy) if op == "Sub" else bb.mul(fx, fy)
                     fp.append(norm(r))
-                    continue
-                if op == "Add":
-                    fp.append(y if cx and x == 0 else x if cy and y == 0 else f.add(x, y))
+                elif op == "Add":
+                    fp.append(y if cx and x == 0 else x if cy and y == 0 else Lazy(op=(op, x, y)))
                 elif op == "Sub":
-                    fp.append(x if cy and y == 0 else f.sub(x, y))
+                    fp.append(x if cy and y == 0 else Lazy(op=(op, x, y)))
+                elif (cx and x == 0) or (cy and y == 0):
+                    fp.append(0)
+                elif cx and x == 1:
+                    fp.append(y)
+                elif cy and y == 1:
+                    fp.append(x)
                 else:
-                    if (cx and x == 0) or (cy and y == 0):
-                        fp.append(0)
-                    elif cx and x == 1:
-                        fp.append(y)
-                    elif cy and y == 1:
-                        fp.append(x)
-                    else:
-                        if isinstance(x, V) and isinstance(y, V) and x.ext and y.ext:
-                            prep(step[1], pk.MUL_IN_BOUND)
-                            prep(step[2], pk.MUL_IN_BOUND)
-                        elif isinstance(x, V) and isinstance(y, V):
-                            if x.bound * y.bound >= 1 << 95:
-                                prep(step[1] if x.bound >= y.bound else step[2], 1 << 35)
-                        fp.append(f.mul(fp[step[1]], fp[step[2]]))
+                    fp.append(Lazy(op=(op, x, y)))
             elif op == "True":
-                mx.append((0, 0))
+                mx.append(("True",))
+                mx_len.append(0)
             elif op == "AndEqz":
-                tot, e = mx[step[1]]
-                term = fp[step[2]]
-                if not (isinstance(term, int) and term == 0):
-                    tot = add_tot(tot, scaled(term, e))
-                mx.append((tot, e + 1))
+                mx.append(("Eqz", step[1], fp[step[2]]))
+                mx_len.append(mx_len[step[1]] + 1)
             elif op == "AndCond":
-                tot, e = mx[step[1]]
-                itot, ie = mx[step[3]]
-                cond = fp[step[2]]
-                if not (isinstance(itot, int) and itot == 0) and not (isinstance(cond, int) and cond == 0):
-                    t = itot if (isinstance(cond, int) and cond == 1) else f.mul(cond, itot)
-                    tot = add_tot(tot, scaled(t, e))
-                mx.append((tot, e + ie))
+                mx.append(("Cond", step[1], fp[step[2]], step[3]))
+                mx_len.append(mx_len[step[1]] + mx_len[step[3]])
             else:
                 raise ValueError(op)
-        tot = mx[self.circuit["poly_ext"]["ret"]][0]
+        tot = horner(self.circuit["poly_ext"]["ret"])
         assert isinstance(tot, V)
         return tot
 
@@ -885,6 +932,15 @@ class Gen:
                 "query_body_bytes": len(body.code), "persist": len(persist), "accesses": m.accesses,
                 "pool": f.pool_candidates()}
         return script, info
+
+
+class Lazy:
+    """A poly_ext value: emitted (`v`) on first use from `op` = (name, x, y)."""
+
+    __slots__ = ("v", "op")
+
+    def __init__(self, v: V | None = None, op: tuple | None = None) -> None:
+        self.v, self.op = v, op
 
 
 def bb_ext(c) -> tuple:
