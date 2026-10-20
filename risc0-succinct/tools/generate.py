@@ -265,6 +265,41 @@ class Gen:
         return a.op("AND", 2, V("col", P, True)).top()
 
     @staticmethod
+    def insert_column(a: Asm, part: V, q4: V, x: V) -> V:
+        """The 64-word FRI row from `part`, its 60 other words, with the canonical extension element `x` as column
+        q4 / 4: word k of x goes before word q4 / 4 of the k-th 15-word segment. Setting bit 320 of x keeps the
+        bytes of every 96-bit lane, so word k is bytes 12k..12k+4."""
+        a.roll(x)
+        xb = a.raw(assemble([1, 8 * 40, "LSHIFT", "OR"]), 1, V("xb")).top()
+        row = None
+        for k in range(4):
+            a.pick(part)
+            a.push(60 * k)
+            a.push(60)
+            seg = a.op("SUBSTR", 3, V("seg")).top()
+            a.pick(seg)
+            a.pick(q4)
+            a.op("LEFT", 2, V())
+            a.pick(xb)
+            a.push(12 * k)
+            a.push(4)
+            a.op("SUBSTR", 3, V())
+            a.op("CAT", 2, V())
+            a.roll(seg)
+            a.pick(q4)
+            a.push(60)
+            a.op("SUBSTR", 3, V())
+            piece = a.op("CAT", 2, V("piece")).top()
+            if row is not None:
+                a.roll(row)
+                a.roll(piece)
+                piece = a.op("CAT", 2, V("row")).top()
+            row = piece
+        a.drop(xb)
+        a.drop(part)
+        return row
+
+    @staticmethod
     def column_consts(stride: int) -> tuple[int, int]:
         g = 32 * stride - pk.W
         mcol = sum(0xFFFFFFFF << (32 * stride * j) for j in range(4))
@@ -433,8 +468,6 @@ class Gen:
         toff = derived([10, "RSHIFT", 992, "AND"], "toff")
         fri_toff = [derived([6, "RSHIFT", 992, "AND"], "t0"), derived([2, "RSHIFT", 992, "AND"], "t1"),
                     derived([4, "MUL", 992, "AND"], "t2")]
-        quot = [derived([16, "RSHIFT"], "q0"), derived([12, "RSHIFT", 15, "AND"], "q1"),
-                derived([8, "RSHIFT", 15, "AND"], "q2")]
         nib = [derived([4, "MUL", 60, "AND"], "n0")]
         nib += [derived([4 * k - 2, "RSHIFT", 60, "AND"], f"n{k}") for k in range(1, 5)]
         a.drop(pos)
@@ -456,8 +489,9 @@ class Gen:
         x = power(bb.ROU_FWD[DOMAIN_PO2], 5, "x")
         s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], [4, 3, 2][r], f"s{r}") for r in range(FRI_ROUNDS)]
         xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], 2, "xf")
-        for v in nib:
+        for v in nib[:2]:
             a.drop(v)
+        quot4 = nib[4:1:-1]  # 4 * the queried column of FRI round r's row
 
         # trace and check rows
         rows = {}
@@ -530,21 +564,19 @@ class Gen:
         a.raw(assemble([1, "NUMEQUAL", "VERIFY"]), 1)
         goal = f.reduce(f.mul(num, inv, True, True))
 
-        # FRI rounds
+        # FRI rounds: the queried column of each row is the goal, so the witness leaves it out and the Script
+        # inserts the goal before the Merkle check
         for r in range(FRI_ROUNDS):
-            row = a.roll(items[f"fri{r}"])
-            self.size_check(a, row, 256)
-            self.range_check(a, row, pv["masks"])
+            part = a.roll(items[f"fri{r}"])
+            self.size_check(a, part, 240)
+            self.range_check(a, part, pv["masks"])
+            row = self.insert_column(a, part, quot4[r], f.canon(goal))
+            a.drop(quot4[r])
             path = a.roll(items[f"fri{r}_path"])
             self.size_check(a, path, 32 * FRI_LEVELS[r])
             self.merkle(a, row, path, FRI_LEVELS[r], bits, pv[f"fri_top{r}"], fri_toff[r])
             a.drop(path)
-            gc = f.canon(goal)
             cols = [self.column(a, row, 16, i, pv) for i in range(16)]
-            a.pick(quot[r])
-            a.raw(assemble([15, "SWAP", "SUB", "PICK"]), 1, V("dq"))
-            a.pick(gc)
-            a.raw(assemble(["NUMEQUAL", "VERIFY"]), 2)
             y = f.reduce(f.mul(pv["rmix"][r], s_r[r]))
             lvl, ys, w = cols, y, bb.ROU_REV[4]
             while len(lvl) > 1:
@@ -944,14 +976,15 @@ def bb_ext(c) -> tuple:
     return c if isinstance(c, tuple) else bb.e(c)
 
 
-def prover_hints(gen: Gen, receipt: dict, seal: bytes) -> list[bytes]:
-    """Per-query DEEP quotient hints for a seal the reference verifier accepts."""
+def prover_hints(gen: Gen, receipt: dict, seal: bytes) -> list[tuple[bytes, int]]:
+    """Per query, the DEEP inverse hint and the query position, for a seal the reference verifier accepts."""
     trace: dict = {}
     ref.verify_receipt(receipt, seal, trace)
-    return wit.deep_hints(wit.split_seal(seal, gen.layout), trace, gen.taps)
+    return list(zip(wit.deep_hints(wit.split_seal(seal, gen.layout), trace, gen.taps),
+                    (q["pos"] for q in trace["queries"])))
 
 
-def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[bytes] | None = None) -> list[bytes]:
+def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[tuple[bytes, int]] | None = None) -> list[bytes]:
     """Witness stack, bottom first; queries deepest (query 0 just below the setup items). `hints` lets tests
     pair any seal (including a rejected one) with chosen hints."""
     if hints is None:
@@ -966,7 +999,10 @@ def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[bytes] | Non
         setup[f"fri_top{r}"] = split["fri_top"][r]
     stack = []
     for q in reversed(range(ref.QUERIES)):
-        items = dict(split["queries"][q], hints=hints[q])
+        hint, pos = hints[q]
+        items = dict(split["queries"][q], hints=hint)
+        for r in range(FRI_ROUNDS):
+            items[f"fri{r}"] = wit.fri_row_part(items[f"fri{r}"], pos >> (16 - 4 * r) & 15)
         stack += [items[n] for n in reversed(QUERY_ITEMS)]
     stack += [setup[n] for n in reversed(SETUP_ITEMS)]
     return stack

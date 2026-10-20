@@ -28,14 +28,14 @@ The Script is specialized to one statement — control ID, control root, inner c
 - 50 queries: query indices from the transcript; Merkle authentication of four trace rows and three FRI layers; DEEP-ALI combination; three fold-by-16 FRI rounds; final degree-64 polynomial evaluation.
 - Exact consumption: every witness item has an exact size, and the Script ends with exactly one `1` on the stack (cleanstack).
 
-The DEEP quotient hints are untrusted: for each query and each tap combination `c` the Script checks `hint_c · D_c(x) = tot_c(x) − U_c(x)`, where `D_c` is the product of `(x − z·ωᵇ)` over the combination's backs, and range-checks every hint word, so a wrong or noncanonical hint is rejected. This replaces per-query field inversions by multiplications.
+The DEEP hint is untrusted: each query's DEEP-ALI value is `Σ_c (tot_c(x) − U_c(x)) / D_c(x)`, where `D_c` is the product of `(x − z·ωᵇ)` over tap combination `c`'s backs. The Script computes it as `num · hint` with `num = Σ_c (tot_c − U_c) Π_{j≠c} D_j`, checks `hint · Π_c D_c = 1`, and range-checks every hint word, so a wrong or noncanonical hint (or a zero denominator) is rejected. This replaces six per-query field inversions by one 16-byte hint and multiplications. The FRI rows in the witness leave out the queried column: it must equal the goal the Script computed, so the Script inserts the goal and the Merkle check covers it.
 
 ### Packed arithmetic
 
 BabyBear extension elements are held as one integer with four 96-bit lanes. Extension multiplication is one `OP_MUL` plus a lane-wise reduction `x − 11·hi + K` (K a multiple of P larger than any subtracted value) and a lane-wise Barrett step. The generator tracks an upper bound for every value and inserts reductions only when a bound would exceed a limit; if any bound would exceed the Barrett range (lanes < 2⁷⁸) generation fails with an assertion, so every emitted reduction runs within its proven range:
 
 - Barrett with `m = ⌊2ᵇⁱᵗˢ/P⌋`, `t = ⌊x/2³⁰⌋`, `q = ⌊t·m/2ᵇⁱᵗˢ⁻³⁰⌋` satisfies `x/P − 2.54 < q ≤ x/P`, so `x − qP ∈ [0, 4P)` with no borrow between lanes. `(bits − 30) + bitlen(m) ≤ 96` for all widths 36–78, so `t·m` never carries into the next lane.
-- Extension-multiply inputs are `< 2³⁵` per lane, so each product coefficient is `< 4·2⁷⁰ = 2⁷²`; base × extension products are kept `< 2⁷²`; sums are asserted `< 2⁷⁸`; subtraction adds a multiple of P no smaller than the subtrahend's bound.
+- Extension-multiply inputs are `< 2³⁶` per lane, so each product coefficient is `< 4·2⁷² = 2⁷⁴` and the folded lanes stay `< 2⁷⁸`; base × extension products are kept `< 2⁷²`; sums are asserted `< 2⁷⁸`; subtraction adds a multiple of P no smaller than the subtrahend's bound.
 
 ## Validation
 

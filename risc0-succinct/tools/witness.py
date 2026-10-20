@@ -1,7 +1,8 @@
 """Prover-side witness preparation: split a seal into the verifier's witness items and compute DEEP hints.
 
 The split is a fixed re-chunking of the seal (every seal word lands in exactly one item, in order), so the Script
-checks each item's exact size and exact consumption of the stack instead of re-parsing the seal.
+checks each item's exact size and exact consumption of the stack instead of re-parsing the seal. The one exception:
+each FRI row leaves out its queried column, which the Script inserts from its own goal (`fri_row_part`).
 """
 import struct
 
@@ -54,6 +55,11 @@ def split_seal(seal_bytes: bytes, layout: Layout) -> dict:
     if pos != len(words):
         raise ref.VerifyError("ReceiptFormatError")
     return s
+
+
+def fri_row_part(row: bytes, column: int) -> bytes:
+    """A FRI row without the queried column (words column + 16k), which the Script inserts from its own goal."""
+    return b"".join(row[64 * k:64 * k + 4 * column] + row[64 * k + 4 * column + 4:64 * (k + 1)] for k in range(4))
 
 
 def row_words(b: bytes) -> list[int]:

@@ -65,7 +65,7 @@ class Covenant:
         return tx
 
     def spend(self, tx: CTransaction, receipt: dict | None = None, seal: bytes | None = None,
-              hints: list[bytes] | None = None) -> dict:
+              hints: list[tuple[bytes, int]] | None = None) -> dict:
         """Fill `tx`'s witness with the receipt (default: the covenant receipt) and return the bundle."""
         witness = g.build_witness(self.gen, receipt or self.receipt, seal or self.seal,
                                   self.hints if hints is None else hints)

@@ -10,7 +10,7 @@ from babybear import P
 W = 96
 LANES = 4
 NBETA_ABS = 11
-MUL_IN_BOUND = 1 << 35  # ext_mul inputs: products of 4 terms stay below 2**72 per lane
+MUL_IN_BOUND = 1 << 36  # ext_mul inputs: products of 4 terms stay below 2**74 per lane
 REDUCED = 4 * P  # Barrett output bound
 
 
@@ -60,7 +60,7 @@ class Barrett:
         return x - q * P
 
 
-EXT_PRODUCT = 1 << 72
+EXT_PRODUCT = 1 << 74
 EXT_K = P * -(-(NBETA_ABS * EXT_PRODUCT) // P)
 EXT_K4 = pack([EXT_K] * LANES)
 EXT_MASK4 = (1 << (W * LANES)) - 1
