@@ -3,7 +3,7 @@ the revision these scripts were measured with.
 
 Install it with
 
-    cargo install --locked --git https://github.com/bitcoin-gsr/gsr-tooling --rev b1f8dcfac05f9eebfbc8418ca58f73f6fc10244f
+    cargo install --locked --git https://github.com/bitcoin-gsr/gsr-tooling --rev bf31cc4ac70e440e49f9a3695a6fd05f7b2866d4
 
 or set `GSR` to a `gsr` binary. The compressed scripts, and so the covenant and rollup addresses, depend on the
 revision.
@@ -14,7 +14,7 @@ import shutil
 import subprocess
 
 REPOSITORY = "https://github.com/bitcoin-gsr/gsr-tooling"
-REVISION = "b1f8dcfac05f9eebfbc8418ca58f73f6fc10244f"
+REVISION = "bf31cc4ac70e440e49f9a3695a6fd05f7b2866d4"
 
 
 def run(*args: str, script: bytes) -> subprocess.CompletedProcess:
@@ -25,9 +25,9 @@ def run(*args: str, script: bytes) -> subprocess.CompletedProcess:
 
 
 def compress(script: bytes, protect: tuple[int, int] = (0, 0)) -> tuple[bytes, dict]:
-    """-> (compressed script, summary). `gsr anchor` first rewrites main-script reads at least 320 deep (its
-    default) to address the value from the stack bottom, so repeated reads become identical; it proves that only one
-    witness item count can succeed and refuses otherwise. `gsr compress` then moves repeats into macros; the result
+    """-> (compressed script, summary). `gsr anchor` first rewrites deep main-script reads to address the value from
+    the stack bottom, so repeated reads become identical; it chooses how deep (or not at all) by compressing each
+    candidate, and it proves that only one witness item count can succeed and refuses otherwise. `gsr compress` then moves repeats into macros; the result
     unrolls to exactly the anchored script and passes `check`. The main-script byte range `protect`, which must start
     at 0 (the rollup leaf's head and prologue), stays literal at its offsets, and the result does not depend on its
     values."""
