@@ -66,7 +66,7 @@ class TestLeaf:
 
     def __init__(self, cov: rc.Covenant, rollup_id: bytes, root: bytes) -> None:
         stmt = rc.RollupStatement(json.loads(TEMPLATE.read_text()), rollup_id, root)
-        stmt.decl_len = cov.decl_len
+        stmt.decl_len, stmt.cs_prefix = cov.decl_len, cov.gen.stmt.cs_prefix
         V.serial = 0
         jd_w, new = V("jd_w"), V("new_root")
         old = V("old_root")
@@ -76,13 +76,15 @@ class TestLeaf:
         m.roll(jd_w)
         m.op("EQUALVERIFY", 2)
         m.drop_top(len(m.st))
-        # The prologue's CompactSize prefix width (5) assumes a script of at least 64 KiB, as the real one is.
-        m.s.data(bytes(60_000)).op("DROP")
+        # The prologue's CompactSize prefix width is the real leaf's; pad into its length class (64 KiB for 5).
+        if stmt.cs_prefix == 5:
+            m.s.data(bytes(60_000)).op("DROP")
         m.s.int(1)
         decls = cov.script[:cov.decl_len]
         self.script = decls + bytes(stmt.head().code) + bytes(m.s.code)
         self.decl_len, self.root = cov.decl_len, root
         assert self.script[self.decl_len:self.decl_len + 33] == b"\x20" + root
+        assert rc.cs_prefix(len(self.script)) == stmt.cs_prefix
         tr = taproot_construct(rc.NUMS, [("rollup", CScript(self.script), rc.LEAF)])
         self.spk = bytes(tr.scriptPubKey)
         self.control = bytes([rc.LEAF | tr.negflag]) + rc.NUMS

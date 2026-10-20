@@ -44,8 +44,12 @@ ANNEX_SELECTOR = bytes([0x00, 0x00, 0x02, 0x00, 0x00, 0x00])
 INDEX_SELECTOR = bytes([0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
 SHAPE_SELECTOR = bytes([0x00, 0x00, 0x08 | 0x20 | 0x40, 0x00, 0x00, 0x00])  # leaf hash, internal key, root
 TAPSCRIPT_SELECTOR = bytes([0x00, 0x01, 0x04, 0x00, 0x00, 0x00])
-CS_PREFIX = 5  # 0xfe || u32: the script is 64 KiB..4 GiB (asserted)
-ROOT_END = CS_PREFIX + 33
+
+
+def cs_prefix(n: int) -> int:
+    """Bytes of the CompactSize length before an n-byte script: 0xfd || u16 below 64 KiB, else 0xfe || u32."""
+    assert 0xFD <= n < 1 << 32
+    return 3 if n < 0x10000 else 5
 
 
 def tag2(name: str) -> bytes:
@@ -56,6 +60,7 @@ class RollupStatement(g.Statement):
     extra_items = ("new_root",)
     head_names = ("old_root",)
     decl_len = 0  # length of the macro declarations before the root push; set by Covenant
+    cs_prefix = 3  # CompactSize bytes before the leaf script (see `cs_prefix`); set by Covenant
 
     def __init__(self, receipt: dict, rollup_id: bytes, old_root: bytes) -> None:
         super().__init__(receipt, covenant=True)
@@ -78,12 +83,12 @@ class RollupStatement(g.Statement):
         ts = m.op("TX", 1, V("tapscript")).top()
         m.push(tag2("TapLeaf") + bytes([LEAF]))
         m.pick(ts)
-        m.push(CS_PREFIX + self.decl_len)
+        m.push(self.cs_prefix + self.decl_len)
         m.raw(assemble(["LEFT", "CAT", b"\x20", "CAT"]), 3, V("leaf_head"))
         m.pick(new)
         m.op("CAT", 2, V("leaf_mid"))
         m.roll(ts)
-        m.push(ROOT_END + self.decl_len)
+        m.push(self.cs_prefix + 33 + self.decl_len)
         m.push(0xFFFFFFFF)
         m.raw(assemble(["SUBSTR", "CAT", "SHA256"]), 4, V("leaf"))
         leaf = m.top()
@@ -138,20 +143,20 @@ class Covenant:
                 info["decl_len"] = info["compression"]["decl_len"]
             return code, info
 
-        # The splice offsets depend on the declarations' length; the declarations do not depend on the offsets
-        # (they sit in the protected prologue), so the second build reproduces the first one's length.
+        # The splice offsets depend on the declarations' length and the script's length class; the declarations do
+        # not depend on the offsets (they sit in the protected prologue), so a rebuild reproduces the lengths.
         for _ in range(3):
             code, info = build()
-            if info["decl_len"] == stmt.decl_len:
+            if (info["decl_len"], cs_prefix(len(code))) == (stmt.decl_len, stmt.cs_prefix):
                 break
-            stmt.decl_len = info["decl_len"]
+            stmt.decl_len, stmt.cs_prefix = info["decl_len"], cs_prefix(len(code))
         else:
             raise RuntimeError("declaration length did not converge")
         self.decl_len = stmt.decl_len
         self.compression = info.get("compression")
         self.script = code
         d = self.decl_len
-        assert self.script[d:d + 33] == b"\x20" + root and 0x10000 <= len(self.script) < 1 << 32
+        assert self.script[d:d + 33] == b"\x20" + root and cs_prefix(len(self.script)) == stmt.cs_prefix
         assert not op_success_offsets(self.script)
         self.functions = info["functions"]
         self.taproot = taproot_construct(NUMS, [("rollup", CScript(self.script), LEAF)])
