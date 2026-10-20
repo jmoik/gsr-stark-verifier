@@ -23,7 +23,7 @@ The Script is specialized to one statement — control ID, control root, inner c
 
 - Transcript: padded-SHA-256 Fiat–Shamir, identical to `ShaRng` over `Sha256Padded`; every seal field word is range-checked `< P`.
 - Output and `po2`: as in native `SuccinctReceipt::verify_integrity`, the even words of output slot 0 must equal the (inner) control root and the 16 half-words of slot 1 must equal the expected claim digest, which commits to the journal, successful termination (`sys_exit` = `user_exit` = 0) and empty assumptions; `po2` must be 18.
-- Code, data, accum and check Merkle tops; the code root must equal the control ID, and the control ID's inclusion path must reach the control root.
+- Code, data, accum and check Merkle tops; the code root must equal the control ID. That the control ID's inclusion path reaches the control root is checked once by the generator, since both are constants of the statement; a receipt whose path does not gets no Script.
 - Constraint evaluation: the generated `poly_ext` program at the DEEP point, combined with `poly_mix`, must equal the check polynomial times the vanishing factor.
 - 50 queries: query indices from the transcript; Merkle authentication of four trace rows and three FRI layers; DEEP-ALI combination; three fold-by-16 FRI rounds; final degree-64 polynomial evaluation.
 - Exact consumption: every witness item has an exact size, and the Script ends with exactly one `1` on the stack (cleanstack).

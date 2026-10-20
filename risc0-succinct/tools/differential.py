@@ -225,10 +225,14 @@ def main() -> None:
     metadata.append(("assumptions_nonempty", with_claim(output=ref.output_digest(
         bytes.fromhex(receipt["claim"]["journal_digest"]), b"\x66" * 32).hex())))
     for name, r in metadata:
-        # The Script is specialized to the expected statement: the verifier for `r` runs on the honest witness
-        # (with `r`'s control inclusion proof).
-        sb = bundle_for(r, g.build_witness(gen, r, seal, hints), cache)
-        check(failures, name, native(r, seal), reference(r, seal), script(sb, args.quick))
+        # The Script is specialized to the expected statement: the verifier for `r` runs on the honest witness.
+        # A statement whose control ID is not a leaf of its control root gets no Script.
+        try:
+            sb = bundle_for(r, g.build_witness(gen, r, seal, hints), cache)
+            spec = script(sb, args.quick)
+        except ValueError as err:
+            spec = (False, f"no Script for statement: {err}")
+        check(failures, name, native(r, seal), reference(r, seal), spec)
     for name, field, value in [("circuit_info_mismatch", "circuit_info", "RECURSION:rev1v2"),
                                ("proof_system_info_mismatch", "proof_system_info", "RISC0_STARK:v2__"),
                                ("hash_suite_mismatch", "hashfn", "sha-256")]:

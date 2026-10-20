@@ -4,7 +4,7 @@
 The script is specialized to the recursion circuit (RECURSION:rev1v1, po2 18) and to one statement: the
 control ID (code root), the control root it must be a leaf of, the inner control root and the claim digest in the
 output globals.
-Everything else -- the seal, the control-ID inclusion proof and per-query DEEP quotient hints -- is witness.
+Everything else -- the seal and per-query DEEP inverse hints -- is witness.
 
 All field values are packed: an extension element is four 96-bit lanes of one integer (see packed.py). Row
 values are kept in RISC Zero's Montgomery (R-scaled) form; every check is linear in them, so the R factor is
@@ -45,7 +45,7 @@ QUERY_ITEMS = ["accum", "accum_path", "code", "code_path", "data", "data_path", 
 # outputs (u64 LE amount, compact-size scriptPubKey), i.e. the BIP 341 `sha_outputs` preimage.
 OUTPUTS_SELECTOR = bytes([0x00, 0x01, 0x00, 0x02, 0x00, 0x03])
 CLAIM_OUT = 16
-SETUP_ITEMS = ["out", "ctrl_index", "ctrl_path", "code_top", "data_top", "accum_top", "check_top", "coeff",
+SETUP_ITEMS = ["out", "code_top", "data_top", "accum_top", "check_top", "coeff",
                "fri_top0", "fri_top1", "fri_top2", "final"]
 
 
@@ -68,6 +68,15 @@ class Statement:
         self.covenant = covenant
         if receipt["hashfn"] != "sha-256-padded" or receipt["circuit_info"] != "RECURSION:rev1v1":
             raise ValueError("unsupported receipt parameters")
+        # Both ends of the control ID's inclusion proof are constants, so it is checked here instead of in Script.
+        proof = receipt["control_inclusion_proof"]
+        node, index = self.control_id, int(proof["index"])
+        for digest in proof["digests"]:
+            sibling = bytes.fromhex(digest)
+            node = hashlib.sha256(sibling + node if index & 1 else node + sibling).digest()
+            index >>= 1
+        if index or node != self.control_root:
+            raise ValueError("the control ID is not a leaf of the control root")
         if covenant:
             claim = receipt["claim"]
             if claim["assumptions_digest"] != "00" * 32 or (claim["sys_exit"], claim["user_exit"]) != (0, 0):
@@ -728,7 +737,7 @@ class Gen:
                 out_vals[i] = m.raw(assemble(["MUL", P, "MOD"]), 2, V(f"out{i}", P)).top()
         m.drop(out)
 
-        # trace commitments; the code root must be a leaf of the control root
+        # trace commitments; the code root must be the control ID (a leaf of the control root, see Statement)
         tops = {}
         for g in ("code", "data", "accum", "check"):
             t = m.roll(s_items[g + "_top"])
@@ -738,27 +747,6 @@ class Gen:
             if g == "code":
                 m.pick(root)
                 m.push(self.stmt.control_id)
-                m.raw(assemble(["EQUAL", "VERIFY"]), 2)
-                idx = m.roll(s_items["ctrl_index"])
-                path = m.roll(s_items["ctrl_path"])
-                self.size_check(m, path, 32 * 8)
-                cur = m.pick(root)
-                for k in range(8):
-                    m.roll(cur)
-                    m.pick(path)
-                    m.push(32 * k)
-                    m.push(32)
-                    m.op("SUBSTR", 3, V())
-                    m.pick(idx)
-                    cur = m.raw(assemble([1, "AND", 0, "ADD", "IF", "SWAP", "ENDIF", "CAT", "SHA256"]), 3,
-                                V("cur")).top()
-                    m.roll(idx)
-                    idx = m.op("2DIV", 1, V("idx")).top()
-                m.drop(path)
-                m.roll(idx)
-                m.raw(assemble([0, "NUMEQUAL", "VERIFY"]), 1)
-                m.roll(cur)
-                m.push(self.stmt.control_root)
                 m.raw(assemble(["EQUAL", "VERIFY"]), 2)
             rng.mix(root)
             if g == "data":
@@ -990,10 +978,7 @@ def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[tuple[bytes,
     if hints is None:
         hints = prover_hints(gen, receipt, seal)
     split = wit.split_seal(seal, gen.layout)
-    proof = receipt["control_inclusion_proof"]
-    setup = {"out": split["out"], "ctrl_index": int(proof["index"]).to_bytes(4, "little").rstrip(b"\0"),
-             "ctrl_path": b"".join(bytes.fromhex(d) for d in proof["digests"]),
-             "code_top": split["code_top"], "data_top": split["data_top"], "accum_top": split["accum_top"],
+    setup = {"out": split["out"], "code_top": split["code_top"], "data_top": split["data_top"], "accum_top": split["accum_top"],
              "check_top": split["check_top"], "coeff": split["coeff"], "final": split["final"]}
     for r in range(FRI_ROUNDS):
         setup[f"fri_top{r}"] = split["fri_top"][r]
