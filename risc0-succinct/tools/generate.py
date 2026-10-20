@@ -22,7 +22,7 @@ import packed as pk
 import reference as ref
 import witness as wit
 from babybear import P
-from field import FN_SPREAD, Field, norm
+from field import FN_MUL, FN_SPREAD, Field, norm
 from gsr import Asm, Script, V, assemble, renumber_calls
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -224,54 +224,35 @@ class Gen:
 
     @staticmethod
     def top_root(a: Asm, top: V, n: int) -> V:
-        level = []
-        for i in range(n // 2):
-            a.pick(top)
-            a.push(64 * i)
-            a.push(64)
-            level.append(a.op("SUBSTR", 3, V()).op("SHA256", 1, V("h")).top())
-        while len(level) > 1:
-            nxt = []
-            for j in range(0, len(level), 2):
-                a.roll(level[j])
-                a.roll(level[j + 1])
-                nxt.append(a.op("CAT", 2, V()).op("SHA256", 1, V("h")).top())
-            level = nxt
-        return level[0]
-
-    @staticmethod
-    def merkle(a: Asm, row: V, path: V, levels: int, bits: list[V], top: V, toff: V) -> None:
-        a.pick(row)
-        a.op("SHA256", 1, V("cur"))
-        for k in range(levels):
-            a.pick(path)
-            a.push(32 * k)
-            a.push(32)
-            a.op("SUBSTR", 3, V())
-            a.pick(bits[k])
-            a.raw(assemble(["IF", "SWAP", "ENDIF", "CAT", "SHA256"]), 3, V("cur"))
+        """Root of the n-node Merkle top. Each level is a string of nodes; every step is the same code on
+        (level acc): hash the level's first two nodes onto acc and drop them."""
         a.pick(top)
-        a.pick(toff)
-        a.push(32)
-        a.op("SUBSTR", 3, V())
-        a.raw(assemble(["EQUAL", "VERIFY"]), 2)
+        while n > 1:
+            a.push(b"")
+            for _ in range(n // 2):
+                a.raw(assemble(["OVER", 64, "LEFT", "SHA256", "CAT", "SWAP", "SIZE", 64, "SUB", "RIGHT", "SWAP"]), 2,
+                      V("level"), V("acc"))
+            a.raw(assemble(["NIP"]), 2, V("level"))
+            n //= 2
+        return a.top()
 
     @staticmethod
-    def column(a: Asm, x: V, stride: int, i: int, consts: dict) -> V:
-        """Extension element from words (i, i+stride, i+2 stride, i+3 stride) of `x`, packed into 96-bit lanes:
-        mask the four words, then one multiplication moves word j from bit 32*stride*j to 3G + 96 j."""
-        a.pick(x)
-        if i:
-            a.push(32 * i)
-            a.op("RSHIFT", 2, V())
-        a.pick(consts[f"mcol{stride}"])
-        a.op("AND", 2, V())
-        a.pick(consts[f"ccol{stride}"])
-        a.op("MUL", 2, V())
-        a.push(3 * (32 * stride - pk.W))
-        a.op("RSHIFT", 2, V())
-        a.pick(consts["mask4"])
-        return a.op("AND", 2, V("col", P, True)).top()
+    def merkle(a: Asm, row: V, path: V, levels: int, idx: V, top: V, consume: bool = False) -> None:
+        """`path` (consumed) authenticates `row` as leaf `idx` under node idx >> levels of `top`. Every level is the
+        same code on (path idx node): the sibling is the path's first 32 bytes, ordered by idx's low bit."""
+        a.roll(path)
+        a.fetch(idx, consume)
+        a.pick(row)
+        a.op("SHA256", 1, V("node"))
+        for _ in range(levels):
+            a.raw(assemble([2, "PICK", 32, "LEFT", 2, "PICK", 1, "AND", 0, "ADD", "IF", "SWAP", "ENDIF", "CAT",
+                            "SHA256", "ROT", "SIZE", 32, "SUB", "RIGHT", "ROT", "2DIV", "ROT"]), 3,
+                  V("path"), V("idx"), V("node"))
+        rest, i = a.top(2), a.top(1)
+        a.pick(top)
+        a.roll(i)
+        a.raw(assemble([32, "MUL", 32, "SUBSTR", "EQUAL", "VERIFY"]), 3)
+        a.drop(rest)
 
     @staticmethod
     def insert_column(a: Asm, part: V, q4: V, x: V) -> V:
@@ -307,6 +288,25 @@ class Gen:
         a.drop(xb)
         a.drop(part)
         return row
+
+    @staticmethod
+    def columns(a: Asm, x: V, stride: int, n: int, consts: dict) -> list[V]:
+        """Extension elements 0..n-1 of `x`, element i from words (i, i+stride, i+2 stride, i+3 stride), packed into
+        96-bit lanes: mask the four words, then one multiplication moves word j from bit 32*stride*j to 3G + 96 j.
+        Every element is the same code on (mcol ccol mask4 x): extract element 0 to the altstack, then shift x down
+        one word."""
+        for v in (consts[f"mcol{stride}"], consts[f"ccol{stride}"], consts["mask4"], x):
+            a.pick(v)
+        step = assemble(["DUP", 4, "PICK", "AND", 3, "PICK", "MUL", 3 * (32 * stride - pk.W), "RSHIFT", 2, "PICK",
+                         "AND", "TOALTSTACK", 32, "RSHIFT"])
+        for _ in range(n):
+            a.raw(step, 1, V("x"))
+        a.raw(assemble(["2DROP", "2DROP"]), 4)
+        cols = [V("col", P, True) for _ in range(n)]
+        for c in reversed(cols):
+            a.s.op("FROMALTSTACK")
+            a.st.append(c)
+        return cols
 
     @staticmethod
     def column_consts(stride: int) -> tuple[int, int]:
@@ -461,46 +461,30 @@ class Gen:
         taps = self.taps
 
         # position-derived values
-        a.pick(pos)
-        bits = []
-        for _ in range(TRACE_LEVELS):
-            b = V("bit", 2)
-            a.raw(assemble(["DUP", 1, "AND", 0, "ADD", "SWAP", "2DIV"]), 1, b, V("p"))
-            bits.append(b)
-        a.op("DROP", 1)
-
         def derived(ops: list, tag: str, bnd: int = 1 << 20) -> V:
             a.pick(pos)
             a.raw(assemble(ops), 1, V(tag, bnd))
             return a.top()
 
-        toff = derived([10, "RSHIFT", 992, "AND"], "toff")
-        fri_toff = [derived([6, "RSHIFT", 992, "AND"], "t0"), derived([2, "RSHIFT", 992, "AND"], "t1"),
-                    derived([4, "MUL", 992, "AND"], "t2")]
-        nib = [derived([4, "MUL", 60, "AND"], "n0")]
-        nib += [derived([4 * k - 2, "RSHIFT", 60, "AND"], f"n{k}") for k in range(1, 5)]
-        a.drop(pos)
+        fri_leaf = [derived([(1 << 16 - 4 * r) - 1, "AND"], f"leaf{r}") for r in range(FRI_ROUNDS)]
+        # 4 * the queried column of FRI round r's row: 4 * (pos >> 16 - 4r & 15)
+        quot4 = [derived([14 - 4 * r, "RSHIFT", 60, "AND"], f"q{r}") for r in range(FRI_ROUNDS)]
 
-        def power(base: int, windows: int, tag: str) -> V:
-            acc: V | None = None
-            for k in range(windows):
-                table = b"".join(struct.pack("<I", pow(base, v << (4 * k), P)) for v in range(16))
-                a.push(table)
-                a.pick(nib[k])
-                a.push(4)
-                a.op("SUBSTR", 3, V("t", P))
-                if acc is not None:
-                    a.raw(assemble(["MUL", P, "MOD"]), 2, V(tag, P))
-                acc = a.top()
-            assert acc is not None
-            return acc
+        def power(base: int, bits: int, tag: str) -> V:
+            """base^(pos mod 2^bits) by square-and-multiply from the low bit: every bit is the same code on
+            (acc base^(2^i) pos >> i)."""
+            a.push(1)
+            a.push(base)
+            a.pick(pos)
+            for _ in range(bits):
+                a.raw(assemble(["DUP", 1, "AND", 0, "ADD", "IF", "ROT", 2, "PICK", "MUL", P, "MOD", "ROT", "ROT",
+                                "ENDIF", "SWAP", "DUP", "MUL", P, "MOD", "SWAP", "2DIV"]), 3, V(), V(), V())
+            a.raw(assemble(["2DROP"]), 3, V(tag, P))
+            return a.top()
 
-        x = power(bb.ROU_FWD[DOMAIN_PO2], 5, "x")
-        s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], [4, 3, 2][r], f"s{r}") for r in range(FRI_ROUNDS)]
-        xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], 2, "xf")
-        for v in nib[:2]:
-            a.drop(v)
-        quot4 = nib[4:1:-1]  # 4 * the queried column of FRI round r's row
+        x = power(bb.ROU_FWD[DOMAIN_PO2], 20, "x")
+        s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], 16 - 4 * r, f"s{r}") for r in range(FRI_ROUNDS)]
+        xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], 8, "xf")
 
         # trace and check rows
         rows = {}
@@ -510,9 +494,9 @@ class Gen:
             self.range_check(a, row, pv["masks"])
             path = a.roll(items[g + "_path"])
             self.size_check(a, path, 32 * TRACE_LEVELS)
-            self.merkle(a, row, path, TRACE_LEVELS, bits, pv[g + "_top"], toff)
-            a.drop(path)
+            self.merkle(a, row, path, TRACE_LEVELS, pos, pv[g + "_top"])
             rows[g] = row
+        a.drop(pos)
         groups = {ref.GROUP_ACCUM: "accum", ref.GROUP_CODE: "code", ref.GROUP_DATA: "data"}
 
         # tot_c = sum over registers of mix^r * row value
@@ -521,18 +505,29 @@ class Gen:
             members[reg["combo"]].append((r, groups[reg["group"]], reg["offset"]))
         for i in range(ref.CHECK_SIZE):
             members[CHECK_COMBO].append((taps.reg_count + i, "check", i))
+        # A run of registers with consecutive row words and indices reads the row from its front: each term is the
+        # same code on (row tail), mix^r staying at a fixed depth as the terms pile up.
         tot = []
         for c in range(CHECK_COMBO + 1):
             terms = []
+            prev = None
             for r, g, off in members[c]:
-                a.pick(rows[g])
-                a.push(4 * off)
-                a.push(4)
-                a.op("SUBSTR", 3, V("w", P))
+                if prev != (r - 1, g, off - 1):
+                    if prev is not None:
+                        a.drop(tail)
+                    a.pick(rows[g])
+                    a.push(4 * off)
+                    a.push(4 * self.layout.rows[g])
+                    tail = a.op("SUBSTR", 3, V("tail")).top()
+                a.raw(assemble(["DUP", 4, "LEFT"]), 0, V("w", P))
                 if r:
                     a.pick(pv["mixpow"][r])
                     a.op("MUL", 2, V("mw", pk.REDUCED * P, True))
                 terms.append(a.top())
+                tail = V("tail")
+                a.raw(assemble(["SWAP", "SIZE", 4, "SUB", "RIGHT"]), 2, terms[-1], tail)
+                prev = (r, g, off)
+            a.drop(tail)
             tot.append(f.reduce(f.sum(terms)))
         for g in rows:
             a.drop(rows[g])
@@ -583,9 +578,8 @@ class Gen:
             a.drop(quot4[r])
             path = a.roll(items[f"fri{r}_path"])
             self.size_check(a, path, 32 * FRI_LEVELS[r])
-            self.merkle(a, row, path, FRI_LEVELS[r], bits, pv[f"fri_top{r}"], fri_toff[r])
-            a.drop(path)
-            cols = [self.column(a, row, 16, i, pv) for i in range(16)]
+            self.merkle(a, row, path, FRI_LEVELS[r], fri_leaf[r], pv[f"fri_top{r}"], consume=True)
+            cols = self.columns(a, row, 16, 16, pv)
             y = f.reduce(f.mul(pv["rmix"][r], s_r[r]))
             lvl, ys, w = cols, y, bb.ROU_REV[4]
             while len(lvl) > 1:
@@ -605,14 +599,20 @@ class Gen:
             goal = f.reduce(f.mul(lvl[0], pow(16, P - 2, P), True))
             a.drop(row)
 
-        # final polynomial at xf
-        xfp = [1, xf]
-        for _ in range(FINAL_DEGREE - 2):
-            xfp.append(f.reduce(f.mul(xfp[-1], xf)))
-        terms = [f.fetch(pv["final"][0])]
-        for k in range(1, FINAL_DEGREE):
-            terms.append(f.mul(pv["final"][k], xfp[k]))
-        fx = f.canon(f.sum(terms))
+        # final polynomial at xf: sum_k c_k xf^k, every term by the same code on (xf acc p x): c_k is words
+        # (0, 64, 128, 192) of x, acc += c_k p, p = p xf mod P, drop x's first word
+        a.roll(xf)
+        a.push(0)
+        a.push(1)
+        a.pick(pv["final"])
+        words = ["DUP", 4, "LEFT"] + [op for k in (1, 2, 3) for op in ("OVER", 256 * k, 4, "SUBSTR", "CAT")]
+        for _ in range(FINAL_DEGREE):
+            a.raw(assemble(words), 0, V())
+            f.fn(FN_SPREAD, pk.spread_ops(), 1, V())
+            a.raw(assemble([2, "PICK", "MUL", 3, "ROLL", "ADD", "ROT", 3, "PICK", "MUL", P, "MOD", "ROT", "SIZE", 4,
+                            "SUB", "RIGHT"]), 4, V("acc"), V("p"), V("x"))
+        a.raw(assemble(["2DROP", "NIP"]), 4, V("fx", FINAL_DEGREE * P * P, True))
+        fx = f.canon(a.top())
         f.canon(goal)
         a.roll(fx)
         a.raw(assemble(["NUMEQUAL", "VERIFY"]), 2)
@@ -775,25 +775,41 @@ class Gen:
                 m.op("SUBSTR", 3, V())
                 raw.append(f.fn(FN_SPREAD, pk.spread_ops(), 1, V("coef", P, True)))
             m.drop(chunk)
-        m.drop(coeff)
 
         # eval_u: coefficient j of a register's polynomial is raw_j * R^-1, evaluated at z * back_one^back
         zp: list = [None, z]
         for _ in range(6):
             zp.append(f.mul(zp[-1], z))
         zr = [bb.R_INV] + [f.reduce(f.mul(zp[j], bb.R_INV)) for j in range(1, 7)]
+        # Each register re-reads its coefficients from the front of (a copy of) the coefficient bytes and moves its
+        # tap values to the altstack, so all registers of a combo are the same code on (copies of zr_1 .. zr_5,
+        # coeff).
         back_one = bb.ROU_REV[PO2]
+        zc = [zr[0]] + [m.pick(v) for v in zr[1:6]]
+        rest = m.roll(coeff)
         eval_u: list[V] = []
-        off = 0
         for reg in taps.regs:
-            coefs = [f.mul(raw[off + j], zr[j]) for j in range(reg["size"])]
+            coefs = []
+            for j in range(reg["size"]):
+                m.roll(rest)
+                m.raw(assemble(["DUP", 16, "LEFT"]), 0, V())
+                c = f.fn(FN_SPREAD, pk.spread_ops(), 1, V("coef", P, True))
+                rest = V("coeff")
+                m.raw(assemble(["SWAP", "SIZE", 16, "SUB", "RIGHT"]), 2, c, rest)
+                coefs.append(f.mul(c, zc[j]))
             for back in reg["backs"]:
                 terms = [f.fetch(coefs[0])]
                 for j in range(1, reg["size"]):
                     c = pow(back_one, back * j, P)
                     terms.append(f.fetch(coefs[j]) if c == 1 else f.mul(coefs[j], c))
                 eval_u.append(f.sum(terms))
-            off += reg["size"]
+                m.op("TOALTSTACK", 1)
+        for v in zc[1:] + [rest]:
+            if m.has(v):
+                m.drop(v)
+        for v in reversed(eval_u):
+            m.s.op("FROMALTSTACK")
+            m.st.append(v)
 
         result = self.poly_ext(f, eval_u, out_vals, mix, poly_mix)
 
@@ -821,10 +837,16 @@ class Gen:
         m.raw(assemble([pk.W, "RSHIFT", "VERIFY"]), 1)
 
         # FRI batching constants
+        # powers of fri_mix, each by the same code on (power fri_mix): OVER OVER mul SWAP
         fri_mix = rng.ext()
         mixpow = [1, fri_mix]
+        assert m.top() is fri_mix and fri_mix.bound <= pk.MUL_IN_BOUND
+        m.raw(assemble(["DUP"]), 0, V("fri_mix", fri_mix.bound, True))
         for _ in range(taps.reg_count + ref.CHECK_SIZE - 2):
-            mixpow.append(f.mul(mixpow[-1], fri_mix))
+            m.raw(assemble(["OVER", "OVER"]), 0, V(), V())
+            mixpow.append(f.fn(FN_MUL, pk.ext_mul_ops(), 2, V("*", pk.REDUCED, True)))
+            m.raw(assemble(["SWAP"]), 2, mixpow[-1], m.top(1))
+        m.drop(m.top())
         cu_terms: list[list[tuple[int, int]]] = [[] for _ in range(taps.tot_combo_backs + 1)]
         off = 0
         for r, reg in enumerate(taps.regs):
@@ -872,14 +894,9 @@ class Gen:
         self.size_check(m, final, 16 * FINAL_DEGREE)
         self.range_check(m, final, masks)
         commit_bytes(final)
-        consts = {}
-        for stride in (16, 64):
-            mc, cc = self.column_consts(stride)
-            consts[f"mcol{stride}"] = m.push(mc, V(f"mcol{stride}"))
-            consts[f"ccol{stride}"] = m.push(cc, V(f"ccol{stride}"))
-        consts["mask4"] = m.push(pk.EXT_MASK4, V("mask4"))
-        final_c = [self.column(m, final, 64, k, consts) for k in range(FINAL_DEGREE)]
-        m.drop(final)
+        mc, cc = self.column_consts(16)
+        consts = {"mcol16": m.push(mc, V("mcol16")), "ccol16": m.push(cc, V("ccol16")),
+                  "mask4": m.push(pk.EXT_MASK4, V("mask4"))}
 
         blob = m.pick(rng.p0)
         for _ in range(6):
@@ -888,26 +905,17 @@ class Gen:
             m.pick(rng.p0)
             blob = m.op("CAT", 2, V("posblob")).top()
 
-        # compact everything the queries need into a fixed persistent block
-        pv = {"masks": short, "mixpow": mixpow, "cu": cu, "dcoef": dcoef, "rmix": rmix, "final": final_c,
-              "mcol16": consts["mcol16"], "ccol16": consts["ccol16"], "mask4": consts["mask4"]}
+        # everything the queries need stays where it is: one more planned access keeps it live, and the query
+        # body addresses the whole stack above the query items (`persist`, dead values included)
+        pv = {"masks": short, "mixpow": mixpow, "cu": cu, "dcoef": dcoef, "rmix": rmix, "final": final, **consts}
         pv.update({g + "_top": tops[g] for g in ("code", "data", "accum", "check")})
         pv.update({f"fri_top{r}": tops[f"fri_top{r}"] for r in range(FRI_ROUNDS)})
-        keep: list = list(short.values()) + [consts["mcol16"], consts["ccol16"], consts["mask4"]]
+        keep: list = list(short.values()) + list(consts.values())
         keep += [tops[k] for k in ("code", "data", "accum", "check")] + [tops[f"fri_top{r}"] for r in range(3)]
-        keep += mixpow[1:] + cu_flat + [v for d in dcoef for v in d] + rmix + final_c + [blob]
+        keep += mixpow[1:] + cu_flat + [v for d in dcoef for v in d] + rmix + [final, blob]
         assert all(isinstance(v, V) for v in keep)
-        for v in reversed(keep):
-            m.pick(v)
-            m.op("TOALTSTACK", 1)
-        region = len(m.st) - len(base)
-        m.s.drop_n(region)
-        m.st = list(base)
-        copies = []
         for v in keep:
-            m.s.op("FROMALTSTACK")
-            m.st.append(v)
-            copies.append(v)
+            m.access(v)
         persist = list(m.st[len(base):])
         m.active = False
 
@@ -978,8 +986,7 @@ def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[tuple[bytes,
     if hints is None:
         hints = prover_hints(gen, receipt, seal)
     split = wit.split_seal(seal, gen.layout)
-    setup = {"out": split["out"], "code_top": split["code_top"], "data_top": split["data_top"], "accum_top": split["accum_top"],
-             "check_top": split["check_top"], "coeff": split["coeff"], "final": split["final"]}
+    setup = {n: split[n] for n in ("out", "code_top", "data_top", "accum_top", "check_top", "coeff", "final")}
     for r in range(FRI_ROUNDS):
         setup[f"fri_top{r}"] = split["fri_top"][r]
     stack = []
