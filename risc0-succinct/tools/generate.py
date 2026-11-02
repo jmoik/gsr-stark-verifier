@@ -27,26 +27,28 @@ from gsr import Asm, Script, V, assemble, renumber_calls
 
 ROOT = Path(__file__).resolve().parents[1]
 FN_QUERY = 200
-PO2 = 18
-DOMAIN_PO2 = PO2 + 2
-TRACE_TOP = 32
-TRACE_LEVELS = 15
-FRI_ROUNDS = 3
-FRI_DOMAIN_PO2 = [16, 12, 8]
+PO2 = ref.PO2
+DOMAIN_PO2 = ref.DOMAIN_PO2
+TRACE_TOP = ref.TRACE_TOP
+TRACE_LEVELS = ref.TRACE_LEVELS
+FRI_ROUNDS = ref.FRI_ROUNDS
+FRI_DOMAIN_PO2 = ref.FRI_ROWS_PO2
 FRI_LEVELS = wit.FRI_LEVELS
-FINAL_DEGREE = 64
+FINAL_DEGREE = ref.FINAL_DEGREE
+D = ref.D
+TRUNC = [D, "LEFT"] if D < 32 else []   # the suite keeps the first D bytes of every commitment digest
 OUT_WORDS = 33
 MASK_SHORT = 528
 MASK_LONG = 10560
 CHECK_COMBO = 5
-QUERY_ITEMS = ["accum", "accum_path", "code", "code_path", "data", "data_path", "check", "check_path",
-               "hints", "fri0", "fri0_path", "fri1", "fri1_path", "fri2", "fri2_path"]
+QUERY_ITEMS = (["accum", "accum_path", "code", "code_path", "data", "data_path", "check", "check_path", "hints"]
+               + [n for r in range(FRI_ROUNDS) for n in (f"fri{r}", f"fri{r}_path")])
 # OP_TX selector: collate, all outputs, amount + scriptPubKey. The result is the concatenation of the serialized
 # outputs (u64 LE amount, compact-size scriptPubKey), i.e. the BIP 341 `sha_outputs` preimage.
 OUTPUTS_SELECTOR = bytes([0x00, 0x01, 0x00, 0x02, 0x00, 0x03])
 CLAIM_OUT = 16
-SETUP_ITEMS = ["out", "code_top", "data_top", "accum_top", "check_top", "coeff",
-               "fri_top0", "fri_top1", "fri_top2", "final"]
+SETUP_ITEMS = (["out", "code_top", "data_top", "accum_top", "check_top", "coeff"]
+               + [f"fri_top{r}" for r in range(FRI_ROUNDS)] + ["final"] + (["pow_nonce"] if ref.POW_BITS else []))
 
 
 def word_mask(n_words: int, sel) -> int:
@@ -66,16 +68,16 @@ class Statement:
         self.inner_control_root = bytes.fromhex(receipt["inner_control_root"])
         self.claim_digest = bytes.fromhex(receipt["claim_digest"])
         self.covenant = covenant
-        if receipt["hashfn"] != "sha-256-padded" or receipt["circuit_info"] != "RECURSION:rev1v1":
+        if receipt["hashfn"] != ref.HASHFN or receipt["circuit_info"] != "RECURSION:rev1v1":
             raise ValueError("unsupported receipt parameters")
         # Both ends of the control ID's inclusion proof are constants, so it is checked here instead of in Script.
         proof = receipt["control_inclusion_proof"]
         node, index = self.control_id, int(proof["index"])
         for digest in proof["digests"]:
             sibling = bytes.fromhex(digest)
-            node = hashlib.sha256(sibling + node if index & 1 else node + sibling).digest()
+            node = ref.H2(sibling, node) if index & 1 else ref.H2(node, sibling)
             index >>= 1
-        if index or node != self.control_root:
+        if index or node[:D] != self.control_root[:D]:
             raise ValueError("the control ID is not a leaf of the control root")
         if covenant:
             claim = receipt["claim"]
@@ -142,11 +144,12 @@ class Rng:
         self.p1 = a.op("CAT", 2, V()).op("SHA256", 1, V("pool1")).top()
         self.p0, self.used = p0, 0
 
-    def mix(self, digest: V) -> None:
+    def mix(self, digest: V, size: int = D) -> None:
+        """pool0 ^= digest zero-padded to 32 bytes (`size`: the digest's length), then step."""
         a = self.a
         a.roll(self.p0)
         a.roll(digest)
-        a.push(b"\x01")
+        a.push(bytes(32 - size) + b"\x01")
         a.op("CAT", 2, V()).op("XOR", 2, V())
         a.push(32)
         self.p0 = a.op("LEFT", 2, V("pool0")).top()
@@ -230,8 +233,8 @@ class Gen:
         while n > 1:
             a.push(b"")
             for _ in range(n // 2):
-                a.raw(assemble(["OVER", 64, "LEFT", "SHA256", "CAT", "SWAP", "SIZE", 64, "SUB", "RIGHT", "SWAP"]), 2,
-                      V("level"), V("acc"))
+                a.raw(assemble(["OVER", 2 * D, "LEFT", "SHA256"] + TRUNC
+                               + ["CAT", "SWAP", "SIZE", 2 * D, "SUB", "RIGHT", "SWAP"]), 2, V("level"), V("acc"))
             a.raw(assemble(["NIP"]), 2, V("level"))
             n //= 2
         return a.top()
@@ -239,19 +242,19 @@ class Gen:
     @staticmethod
     def merkle(a: Asm, row: V, path: V, levels: int, idx: V, top: V, consume: bool = False) -> None:
         """`path` (consumed) authenticates `row` as leaf `idx` under node idx >> levels of `top`. Every level is the
-        same code on (path idx node): the sibling is the path's first 32 bytes, ordered by idx's low bit."""
+        same code on (path idx node): the sibling is the path's first D bytes, ordered by idx's low bit."""
         a.roll(path)
         a.fetch(idx, consume)
         a.pick(row)
-        a.op("SHA256", 1, V("node"))
+        a.raw(assemble(["SHA256"] + TRUNC), 1, V("node"))
         for _ in range(levels):
-            a.raw(assemble([2, "PICK", 32, "LEFT", 2, "PICK", 1, "AND", 0, "ADD", "IF", "SWAP", "ENDIF", "CAT",
-                            "SHA256", "ROT", "SIZE", 32, "SUB", "RIGHT", "ROT", "2DIV", "ROT"]), 3,
+            a.raw(assemble([2, "PICK", D, "LEFT", 2, "PICK", 1, "AND", 0, "ADD", "IF", "SWAP", "ENDIF", "CAT",
+                            "SHA256"] + TRUNC + ["ROT", "SIZE", D, "SUB", "RIGHT", "ROT", "2DIV", "ROT"]), 3,
                   V("path"), V("idx"), V("node"))
         rest, i = a.top(2), a.top(1)
         a.pick(top)
         a.roll(i)
-        a.raw(assemble([32, "MUL", 32, "SUBSTR", "EQUAL", "VERIFY"]), 3)
+        a.raw(assemble([D, "MUL", D, "SUBSTR", "EQUAL", "VERIFY"]), 3)
         a.drop(rest)
 
     @staticmethod
@@ -455,20 +458,20 @@ class Gen:
     # ---- the per-query function body ----
     def query_body(self, persist: list[V], pv: dict) -> tuple[Script, list[V]]:
         items = {n: V(n) for n in QUERY_ITEMS}
-        pos = V("pos", 1 << 20)
+        pos = V("pos", 1 << DOMAIN_PO2)
         a = Asm([items[n] for n in reversed(QUERY_ITEMS)] + persist + [pos])
         f = Field(a, inline=False, used=self.used)
         taps = self.taps
 
         # position-derived values
-        def derived(ops: list, tag: str, bnd: int = 1 << 20) -> V:
+        def derived(ops: list, tag: str, bnd: int = 1 << DOMAIN_PO2) -> V:
             a.pick(pos)
             a.raw(assemble(ops), 1, V(tag, bnd))
             return a.top()
 
-        fri_leaf = [derived([(1 << 16 - 4 * r) - 1, "AND"], f"leaf{r}") for r in range(FRI_ROUNDS)]
-        # 4 * the queried column of FRI round r's row: 4 * (pos >> 16 - 4r & 15)
-        quot4 = [derived([14 - 4 * r, "RSHIFT", 60, "AND"], f"q{r}") for r in range(FRI_ROUNDS)]
+        fri_leaf = [derived([(1 << FRI_DOMAIN_PO2[r]) - 1, "AND"], f"leaf{r}") for r in range(FRI_ROUNDS)]
+        # 4 * the queried column of FRI round r's row: 4 * (pos >> FRI_DOMAIN_PO2[r] & 15)
+        quot4 = [derived([FRI_DOMAIN_PO2[r] - 2, "RSHIFT", 60, "AND"], f"q{r}") for r in range(FRI_ROUNDS)]
 
         def power(base: int, bits: int, tag: str) -> V:
             """base^(pos mod 2^bits) by square-and-multiply from the low bit: every bit is the same code on
@@ -482,9 +485,9 @@ class Gen:
             a.raw(assemble(["2DROP"]), 3, V(tag, P))
             return a.top()
 
-        x = power(bb.ROU_FWD[DOMAIN_PO2], 20, "x")
-        s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], 16 - 4 * r, f"s{r}") for r in range(FRI_ROUNDS)]
-        xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], 8, "xf")
+        x = power(bb.ROU_FWD[DOMAIN_PO2], DOMAIN_PO2, "x")
+        s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], FRI_DOMAIN_PO2[r], f"s{r}") for r in range(FRI_ROUNDS)]
+        xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], FRI_DOMAIN_PO2[-1], "xf")
 
         # trace and check rows
         rows = {}
@@ -493,7 +496,7 @@ class Gen:
             self.size_check(a, row, 4 * self.layout.rows[g])
             self.range_check(a, row, pv["masks"])
             path = a.roll(items[g + "_path"])
-            self.size_check(a, path, 32 * TRACE_LEVELS)
+            self.size_check(a, path, D * TRACE_LEVELS)
             self.merkle(a, row, path, TRACE_LEVELS, pos, pv[g + "_top"])
             rows[g] = row
         a.drop(pos)
@@ -577,7 +580,7 @@ class Gen:
             row = self.insert_column(a, part, quot4[r], f.canon(goal))
             a.drop(quot4[r])
             path = a.roll(items[f"fri{r}_path"])
-            self.size_check(a, path, 32 * FRI_LEVELS[r])
+            self.size_check(a, path, D * FRI_LEVELS[r])
             self.merkle(a, row, path, FRI_LEVELS[r], fri_leaf[r], pv[f"fri_top{r}"], consume=True)
             cols = self.columns(a, row, 16, 16, pv)
             y = f.reduce(f.mul(pv["rmix"][r], s_r[r]))
@@ -600,12 +603,13 @@ class Gen:
             a.drop(row)
 
         # final polynomial at xf: sum_k c_k xf^k, every term by the same code on (xf acc p x): c_k is words
-        # (0, 64, 128, 192) of x, acc += c_k p, p = p xf mod P, drop x's first word
+        # (0, d, 2d, 3d) of x with d = FINAL_DEGREE, acc += c_k p, p = p xf mod P, drop x's first word
         a.roll(xf)
         a.push(0)
         a.push(1)
         a.pick(pv["final"])
-        words = ["DUP", 4, "LEFT"] + [op for k in (1, 2, 3) for op in ("OVER", 256 * k, 4, "SUBSTR", "CAT")]
+        words = ["DUP", 4, "LEFT"] + [op for k in (1, 2, 3)
+                                      for op in ("OVER", 4 * FINAL_DEGREE * k, 4, "SUBSTR", "CAT")]
         for _ in range(FINAL_DEGREE):
             a.raw(assemble(words), 0, V())
             f.fn(FN_SPREAD, pk.spread_ops(), 1, V())
@@ -696,13 +700,13 @@ class Gen:
 
         rng_host = ref.Rng()
         for info in (ref.PROOF_SYSTEM_INFO, circuit["circuit_info"].encode()):
-            h = ref.sha(ref.words_bytes([bb.to_mont(b) for b in info] + [0] * (16 - len(info))))
+            h = ref.H(ref.words_bytes([bb.to_mont(b) for b in info] + [0] * (16 - len(info))))
             rng_host.mix(h)
         rng = Rng(m, rng_host.pool0, rng_host.pool1)
 
         def commit_bytes(v: V) -> None:
             m.pick(v)
-            rng.mix(m.op("SHA256", 1, V("d")).top())
+            rng.mix(m.raw(assemble(["SHA256"] + TRUNC), 1, V("d")).top())
 
         claim_words = self.covenant(m) if self.stmt.covenant else None
 
@@ -741,12 +745,12 @@ class Gen:
         tops = {}
         for g in ("code", "data", "accum", "check"):
             t = m.roll(s_items[g + "_top"])
-            self.size_check(m, t, 32 * TRACE_TOP)
+            self.size_check(m, t, D * TRACE_TOP)
             root = self.top_root(m, t, TRACE_TOP)
             tops[g] = t
             if g == "code":
                 m.pick(root)
-                m.push(self.stmt.control_id)
+                m.push(self.stmt.control_id[:D])
                 m.raw(assemble(["EQUAL", "VERIFY"]), 2)
             rng.mix(root)
             if g == "data":
@@ -886,20 +890,29 @@ class Gen:
         rmix = []
         for r in range(FRI_ROUNDS):
             t = m.roll(s_items[f"fri_top{r}"])
-            self.size_check(m, t, 32 * 32)
-            rng.mix(self.top_root(m, t, 32))
+            self.size_check(m, t, D * ref.FRI_TOP[r])
+            rng.mix(self.top_root(m, t, ref.FRI_TOP[r]))
             tops[f"fri_top{r}"] = t
             rmix.append(rng.ext())
         final = m.roll(s_items["final"])
         self.size_check(m, final, 16 * FINAL_DEGREE)
         self.range_check(m, final, masks)
         commit_bytes(final)
+        if ref.POW_BITS:
+            # proof of work: the nonce mixed into the transcript leaves the next word's low POW_BITS zero
+            nonce = m.roll(s_items["pow_nonce"])
+            self.size_check(m, nonce, 4)
+            rng.mix(nonce, 4)
+            rng.word()
+            m.push((1 << ref.POW_BITS) - 1)
+            m.raw(assemble(["AND", 0, "ADD", 0, "NUMEQUAL", "VERIFY"]), 2)
         mc, cc = self.column_consts(16)
         consts = {"mcol16": m.push(mc, V("mcol16")), "ccol16": m.push(cc, V("ccol16")),
                   "mask4": m.push(pk.EXT_MASK4, V("mask4"))}
 
+        first = rng.used    # transcript words already drawn from pool0 (the proof-of-work word)
         blob = m.pick(rng.p0)
-        for _ in range(6):
+        for _ in range((first + ref.QUERIES + 7) // 8 - 1):
             rng.step()
             m.roll(blob)
             m.pick(rng.p0)
@@ -911,7 +924,8 @@ class Gen:
         pv.update({g + "_top": tops[g] for g in ("code", "data", "accum", "check")})
         pv.update({f"fri_top{r}": tops[f"fri_top{r}"] for r in range(FRI_ROUNDS)})
         keep: list = list(short.values()) + list(consts.values())
-        keep += [tops[k] for k in ("code", "data", "accum", "check")] + [tops[f"fri_top{r}"] for r in range(3)]
+        keep += [tops[k] for k in ("code", "data", "accum", "check")]
+        keep += [tops[f"fri_top{r}"] for r in range(FRI_ROUNDS)]
         keep += mixpow[1:] + cu_flat + [v for d in dcoef for v in d] + rmix + [final, blob]
         assert all(isinstance(v, V) for v in keep)
         for v in keep:
@@ -924,10 +938,10 @@ class Gen:
 
         for q in range(ref.QUERIES):
             m.pick(blob)
-            m.push(4 * q)
+            m.push(4 * (first + q))
             m.push(4)
             m.op("SUBSTR", 3, V())
-            m.push(0xFFFFF)
+            m.push((1 << DOMAIN_PO2) - 1)
             m.raw(assemble(["AND", 0, "ADD"]), 2, V("pos"))
             m.call(FN_QUERY, 1)
             block = q_items[q]
@@ -989,12 +1003,14 @@ def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[tuple[bytes,
     setup = {n: split[n] for n in ("out", "code_top", "data_top", "accum_top", "check_top", "coeff", "final")}
     for r in range(FRI_ROUNDS):
         setup[f"fri_top{r}"] = split["fri_top"][r]
+    if ref.POW_BITS:
+        setup["pow_nonce"] = split["pow_nonce"]
     stack = []
     for q in reversed(range(ref.QUERIES)):
         hint, pos = hints[q]
         items = dict(split["queries"][q], hints=hint)
         for r in range(FRI_ROUNDS):
-            items[f"fri{r}"] = wit.fri_row_part(items[f"fri{r}"], pos >> (16 - 4 * r) & 15)
+            items[f"fri{r}"] = wit.fri_row_part(items[f"fri{r}"], pos >> FRI_DOMAIN_PO2[r] & 15)
         stack += [items[n] for n in reversed(QUERY_ITEMS)]
     stack += [setup[n] for n in reversed(SETUP_ITEMS)]
     return stack

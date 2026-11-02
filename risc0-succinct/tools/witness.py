@@ -10,10 +10,11 @@ import babybear as bb
 import reference as ref
 from babybear import P
 
-TRACE_TOP = 32
-TRACE_LEVELS = 15
-FRI_LEVELS = [11, 7, 3]
+TRACE_TOP = ref.TRACE_TOP
+TRACE_LEVELS = ref.TRACE_LEVELS
+FRI_LEVELS = ref.FRI_LEVELS
 COMBOS = 5
+D = ref.D
 
 
 class Layout:
@@ -37,20 +38,27 @@ def split_seal(seal_bytes: bytes, layout: Layout) -> dict:
         pos += n
         return out
 
-    s: dict = {"out": take(33), "code_top": take(8 * TRACE_TOP), "data_top": take(8 * TRACE_TOP),
-               "accum_top": take(8 * TRACE_TOP), "check_top": take(8 * TRACE_TOP),
+    def digests(n: int) -> bytes:
+        """n seal digests (8 words each), keeping the D bytes the suite commits to."""
+        raw = take(8 * n)
+        return b"".join(raw[32 * i:32 * i + D] for i in range(n))
+
+    s: dict = {"out": take(33), "code_top": digests(TRACE_TOP), "data_top": digests(TRACE_TOP),
+               "accum_top": digests(TRACE_TOP), "check_top": digests(TRACE_TOP),
                "coeff": take(layout.coeff_words), "fri_top": [], "queries": []}
-    for _ in range(3):
-        s["fri_top"].append(take(8 * 32))
-    s["final"] = take(4 * 64)
+    for top in ref.FRI_TOP:
+        s["fri_top"].append(digests(top))
+    s["final"] = take(4 * ref.FINAL_DEGREE)
+    if ref.POW_BITS:
+        s["pow_nonce"] = take(1)
     for _ in range(ref.QUERIES):
         q: dict = {}
         for g in ("accum", "code", "data", "check"):
             q[g] = take(layout.rows[g])
-            q[g + "_path"] = take(8 * TRACE_LEVELS)
+            q[g + "_path"] = digests(TRACE_LEVELS)
         for r, levels in enumerate(FRI_LEVELS):
-            q[f"fri{r}"] = take(64)
-            q[f"fri{r}_path"] = take(8 * levels)
+            q[f"fri{r}"] = take(4 * ref.FRI_FOLD)
+            q[f"fri{r}_path"] = digests(levels)
         s["queries"].append(q)
     if pos != len(words):
         raise ref.VerifyError("ReceiptFormatError")
@@ -72,7 +80,7 @@ def deep_hints(split: dict, trace: dict, taps: "ref.TapSet") -> list[bytes]:
     z, fri_mix = trace["z"], trace["fri_mix"]
     back_one = bb.ROU_REV[trace["po2"]]
     combo_u = [bb.scale(c, bb.R) for c in trace["combo_u"]]
-    gen = bb.ROU_FWD[20]
+    gen = bb.ROU_FWD[ref.DOMAIN_PO2]
     pows, cur = [], bb.ONE
     for _ in range(taps.reg_count + ref.CHECK_SIZE):
         pows.append(cur)

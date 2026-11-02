@@ -92,6 +92,19 @@ python3 covenant.py --regtest   # generate, meter, negative cases, fund/accept/m
 
 The outputs above pay 49.998 BTC to a key-path P2TR address derived from `SHA256("gsr covenant demo destination")`. Changing the destination needs a new proof but not a new Script; changing the guest needs a new Script. The transaction's inputs, version, locktime and sequences are not restricted by the journal, only its outputs.
 
+## Smaller proofs: FRI parameters for Script
+
+RISC Zero's FRI parameters suit its Groth16 wrapper, where the STARK's size does not matter; in Script every query costs weight. [risc0-fri-params.patch](risc0-fri-params.patch), applied after risc0-v3.0.6.patch, lets the final `identity_sha256_padded` proof use its own FRI parameters, a proof-of-work step and `sha-256-padded-t26` (commitment digests truncated to 26 bytes). Segment, lift and join proofs keep the stock parameters, so the inner control root is unchanged. The tools take the same parameters from `GSR_FRI_PARAMS` (stock when unset, with byte-identical output). With 18 queries at inverse rate 16 and 28 bits of grinding (100 conjectured bits, like 50 queries at inverse rate 4), the compressed fixed-statement spend drops from 271,640 to 137,709 WU:
+
+```sh
+export GSR_FRI_PARAMS='{"hashfn": "sha-256-padded-t26", "queries": 18, "log_inv_rate": 4, "pow_bits": 28, "cap_log": 5}'
+cd ~/risc0   # re-proves the fixture into <dir>
+R0_GSR_SEAL_DIR=<dir> cargo test --release -p risc0-zkvm --features prove --lib gsr_fri_params_prove -- --include-ignored --nocapture
+cd risc0-succinct/tools
+python3 generate.py --compress --receipt ../fixtures/fri-params-receipt.json --seal ../fixtures/fri-params-seal.bin
+python3 measure.py
+```
+
 ## Scope
 
 This verifies one succinct receipt shape: the recursion circuit at `po2` 18, fixed control ID and root, and the padded hash suite. RISC Zero does not ship `sha-256-padded`; the patch adds it without changing the recursion circuit, so a prover must use the patched suite to produce receipts this Script accepts. Another statement needs a regenerated Script (in the covenant mode, another image ID). The FRI configuration gives about 97 conjectured bits of security, as in stock RISC Zero. This is unaudited research code.

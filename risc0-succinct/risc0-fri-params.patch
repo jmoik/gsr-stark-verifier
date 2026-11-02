@@ -1,0 +1,821 @@
+diff --git a/risc0/circuit/recursion-sys/kernels/cxx/ffi.cpp b/risc0/circuit/recursion-sys/kernels/cxx/ffi.cpp
+index 1d92842..55473a1 100644
+--- a/risc0/circuit/recursion-sys/kernels/cxx/ffi.cpp
++++ b/risc0/circuit/recursion-sys/kernels/cxx/ffi.cpp
+@@ -43,6 +43,8 @@
+ using namespace risc0;
+ using namespace risc0::circuit::recursion;
+ 
++extern size_t kInvRate; // poly_fp.cpp
++
+ constexpr size_t kStepModeParallel = 0;
+ constexpr size_t kStepModeSeqForward = 1;
+ constexpr size_t kStepModeSeqReverse = 2;
+@@ -221,6 +223,7 @@ const char* risc0_circuit_recursion_cpu_eval_check(
+     AccumBuffers* buffers, FpExt* poly_mix, Fp* check, Fp rou, uint32_t po2, uint32_t steps) {
+   try {
+     nvtx3::scoped_range range("evalCheck");
++    kInvRate = steps >> po2;
+     std::array<Fp*, 5> args{
+         buffers->ctrl,
+         buffers->global,
+diff --git a/risc0/circuit/recursion-sys/kernels/cxx/poly_fp.cpp b/risc0/circuit/recursion-sys/kernels/cxx/poly_fp.cpp
+index edf4049..e1420f9 100644
+--- a/risc0/circuit/recursion-sys/kernels/cxx/poly_fp.cpp
++++ b/risc0/circuit/recursion-sys/kernels/cxx/poly_fp.cpp
+@@ -19,7 +19,8 @@
+ 
+ #include <cstdint>
+ 
+-constexpr size_t kInvRate = 4;
++// GSR research: the blowup of the proof being made, set by risc0_circuit_recursion_cpu_eval_check.
++size_t kInvRate = 4;
+ 
+ // clang-format off
+ namespace risc0::circuit::recursion {
+diff --git a/risc0/circuit/recursion/src/prove/hal/cpu.rs b/risc0/circuit/recursion/src/prove/hal/cpu.rs
+index c46954b..1432124 100644
+--- a/risc0/circuit/recursion/src/prove/hal/cpu.rs
++++ b/risc0/circuit/recursion/src/prove/hal/cpu.rs
+@@ -25,7 +25,9 @@ use risc0_zkp::{
+     core::{
+         hash::{
+             poseidon2::Poseidon2HashSuite, poseidon_254::Poseidon254HashSuite, sha::Sha256HashSuite,
+-            sha_padded::{PaddedSha256HashSuite, SHA256_PADDED},
++            sha_padded::{
++                PaddedSha256HashSuite, TruncatedSha256HashSuite, SHA256_PADDED, SHA256_PADDED_T26,
++            },
+         },
+         log2_ceil,
+     },
+@@ -34,7 +36,6 @@ use risc0_zkp::{
+         map_pow, RootsOfUnity as _,
+     },
+     hal::{cpu::CpuBuffer, AccumPreflight, CircuitHal},
+-    INV_RATE,
+ };
+ 
+ use crate::{
+@@ -112,8 +113,8 @@ impl CircuitHal<CpuHal> for CpuCircuitHal {
+         po2: usize,
+         steps: usize,
+     ) {
+-        const EXP_PO2: usize = log2_ceil(INV_RATE);
+-        let domain = steps * INV_RATE;
++        let exp_po2 = log2_ceil(risc0_zkp::inv_rate());
++        let domain = steps * risc0_zkp::inv_rate();
+ 
+         let ctrl = groups[REGISTER_GROUP_CTRL].as_slice();
+         let data = groups[REGISTER_GROUP_DATA].as_slice();
+@@ -125,7 +126,7 @@ impl CircuitHal<CpuHal> for CpuCircuitHal {
+         let poly_mix_pows = map_pow(poly_mix, crate::info::POLY_MIX_POWERS);
+         let poly_mix_pows = poly_mix_pows.as_slice();
+ 
+-        let rou = BabyBearElem::ROU_FWD[po2 + EXP_PO2];
++        let rou = BabyBearElem::ROU_FWD[po2 + exp_po2];
+ 
+         let buffers = RawAccumBuffers {
+             ctrl: ctrl.as_ptr(),
+@@ -170,6 +171,7 @@ pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>>
+         "poseidon_254" => Poseidon254HashSuite::new_suite(),
+         "sha-256" => Sha256HashSuite::new_suite(),
+         SHA256_PADDED => PaddedSha256HashSuite::new_suite(),
++        SHA256_PADDED_T26 => TruncatedSha256HashSuite::new_suite(),
+         _ => bail!("Unsupported hashfn: {hashfn}"),
+     };
+ 
+diff --git a/risc0/zkp/src/core/hash/mod.rs b/risc0/zkp/src/core/hash/mod.rs
+index ed59a38..d5bc802 100644
+--- a/risc0/zkp/src/core/hash/mod.rs
++++ b/risc0/zkp/src/core/hash/mod.rs
+@@ -99,6 +99,13 @@ pub trait Rng<F: Field> {
+ 
+     /// Get a cryptographically uniform extension field element
+     fn random_ext_elem(&mut self) -> F::ExtElem;
++
++    /// Proof of work: the smallest nonce such that mixing `[nonce, 0, ..., 0]` into a copy of this RNG makes
++    /// `random_bits(bits)` zero. `None` if this RNG does not support grinding.
++    fn grind(&self, bits: usize) -> Option<u32> {
++        let _ = bits;
++        None
++    }
+ }
+ 
+ /// Responsible for constructing new Rngs.
+@@ -135,6 +142,7 @@ pub fn hash_suite_from_name(name: impl AsRef<str>) -> Option<HashSuite<BabyBear>
+     match name.as_ref() {
+         "sha-256" => Some(sha::Sha256HashSuite::new_suite()),
+         sha_padded::SHA256_PADDED => Some(sha_padded::PaddedSha256HashSuite::new_suite()),
++        sha_padded::SHA256_PADDED_T26 => Some(sha_padded::TruncatedSha256HashSuite::new_suite()),
+         "poseidon2" => Some(poseidon2::Poseidon2HashSuite::new_suite()),
+         "blake2b" => Some(blake2b::Blake2bCpuHashSuite::new_suite()),
+         #[cfg(feature = "prove")]
+diff --git a/risc0/zkp/src/core/hash/sha_padded.rs b/risc0/zkp/src/core/hash/sha_padded.rs
+index 8322d4f..93e7a69 100644
+--- a/risc0/zkp/src/core/hash/sha_padded.rs
++++ b/risc0/zkp/src/core/hash/sha_padded.rs
+@@ -40,6 +40,14 @@ use crate::core::digest::{Digest, DIGEST_BYTES, DIGEST_WORDS};
+ /// Name under which this suite is registered with [`hash_suite_from_name`](super::hash_suite_from_name).
+ pub const SHA256_PADDED: &str = "sha-256-padded";
+ 
++/// The padded suite with every commitment digest truncated to [`T26_BYTES`] bytes (the rest zero): leaves are
++/// `SHA256(row)[..26]` and parents `SHA256(left[..26] || right[..26])[..26]`, one compression block. The
++/// transcript is the padded suite's, mixing the zero-padded digests.
++pub const SHA256_PADDED_T26: &str = "sha-256-padded-t26";
++
++/// Digest bytes kept by [`SHA256_PADDED_T26`].
++pub const T26_BYTES: usize = 26;
++
+ struct PaddedSha256HashFn;
+ 
+ fn hash_pair_padded(a: &Digest, b: &Digest) -> Box<Digest> {
+@@ -57,6 +65,31 @@ fn hash_slice_padded<T: bytemuck::NoUninit>(slice: &[T]) -> Box<Digest> {
+     (*Impl::hash_bytes(bytes)).into()
+ }
+ 
++fn truncate(mut d: Box<Digest>) -> Box<Digest> {
++    d.as_mut_bytes()[T26_BYTES..].fill(0);
++    d
++}
++
++struct TruncatedSha256HashFn;
++
++impl<F: Field> super::HashFn<F> for TruncatedSha256HashFn {
++    fn hash_pair(&self, a: &Digest, b: &Digest) -> Box<Digest> {
++        let mut block = [0u8; 2 * T26_BYTES];
++        block[..T26_BYTES].copy_from_slice(&a.as_bytes()[..T26_BYTES]);
++        block[T26_BYTES..].copy_from_slice(&b.as_bytes()[..T26_BYTES]);
++        gsr_counters::bump(&gsr_counters::SHA_PAIR, 1);
++        truncate((*Impl::hash_bytes(&block)).into())
++    }
++
++    fn hash_elem_slice(&self, slice: &[F::Elem]) -> Box<Digest> {
++        truncate(hash_slice_padded(slice))
++    }
++
++    fn hash_ext_elem_slice(&self, slice: &[F::ExtElem]) -> Box<Digest> {
++        truncate(hash_slice_padded(slice))
++    }
++}
++
+ impl<F: Field> super::HashFn<F> for PaddedSha256HashFn {
+     fn hash_pair(&self, a: &Digest, b: &Digest) -> Box<Digest> {
+         hash_pair_padded(a, b)
+@@ -111,6 +144,43 @@ impl PaddedShaRng {
+         self.pool1 = hash_pair_padded(&self.pool0, &self.pool1);
+         self.pool_used = 0;
+     }
++
++    /// The smallest nonce such that mixing `[nonce, 0, ..., 0]` leaves the next word's low `bits` zero,
++    /// searched on `RAYON_NUM_THREADS` (else all) cores.
++    #[cfg(feature = "std")]
++    pub fn grind_nonce(&self, bits: usize) -> u32 {
++        use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
++        let mask = (1u32 << bits) - 1;
++        let threads = std::env::var("RAYON_NUM_THREADS")
++            .ok()
++            .and_then(|v| v.parse::<u32>().ok())
++            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u32))
++            .max(1);
++        let found = AtomicU32::new(u32::MAX);
++        std::thread::scope(|s| {
++            for t in 0..threads {
++                let found = &found;
++                s.spawn(move || {
++                    let mut r = self.clone();
++                    let mut n = t;
++                    while n < found.load(Relaxed) {
++                        *r.pool0 = *self.pool0;
++                        *r.pool1 = *self.pool1;
++                        r.inner_mix(&crate::pow_digest(n));
++                        if r.next_u32() & mask == 0 {
++                            found.fetch_min(n, Relaxed);
++                            return;
++                        }
++                        match n.checked_add(threads) {
++                            Some(m) => n = m,
++                            None => return,
++                        }
++                    }
++                });
++            }
++        });
++        found.into_inner()
++    }
+ }
+ 
+ impl RngCore for PaddedShaRng {
+@@ -148,6 +218,11 @@ impl<F: Field> Rng<F> for PaddedShaRng {
+     fn random_ext_elem(&mut self) -> F::ExtElem {
+         F::ExtElem::random(self)
+     }
++
++    #[cfg(feature = "std")]
++    fn grind(&self, bits: usize) -> Option<u32> {
++        Some(self.grind_nonce(bits))
++    }
+ }
+ 
+ struct PaddedSha256RngFactory;
+@@ -175,3 +250,19 @@ impl<F: Field> PaddedSha256HashSuite<F> {
+     }
+ }
+ 
++/// A [HashSuite] using padded SHA-256 with commitment digests truncated to 26 bytes.
++pub struct TruncatedSha256HashSuite<F: Field> {
++    phantom: PhantomData<F>,
++}
++
++impl<F: Field> TruncatedSha256HashSuite<F> {
++    /// Construct a [TruncatedSha256HashSuite].
++    pub fn new_suite() -> HashSuite<F> {
++        use alloc::rc::Rc;
++        HashSuite {
++            name: SHA256_PADDED_T26.into(),
++            hashfn: Rc::new(TruncatedSha256HashFn {}),
++            rng: Rc::new(PaddedSha256RngFactory {}),
++        }
++    }
++}
+diff --git a/risc0/zkp/src/hal/mod.rs b/risc0/zkp/src/hal/mod.rs
+index bdb2dc0..a6fac17 100644
+--- a/risc0/zkp/src/hal/mod.rs
++++ b/risc0/zkp/src/hal/mod.rs
+@@ -31,10 +31,7 @@ use risc0_core::{
+     scope,
+ };
+ 
+-use crate::{
+-    core::{digest::Digest, hash::HashSuite, poly::poly_divide},
+-    INV_RATE,
+-};
++use crate::core::{digest::Digest, hash::HashSuite, poly::poly_divide};
+ 
+ pub trait Buffer<T>: Clone {
+     fn name(&self) -> &'static str;
+@@ -58,7 +55,7 @@ pub trait Hal {
+     type ExtElem: ExtElem<SubElem = Self::Elem>;
+     type Buffer<T: Clone + Debug + PartialEq>: Buffer<T>;
+ 
+-    const CHECK_SIZE: usize = INV_RATE * Self::ExtElem::EXT_SIZE;
++    const CHECK_SIZE: usize = crate::CHECK_PIECES * Self::ExtElem::EXT_SIZE;
+ 
+     fn has_unified_memory(&self) -> bool;
+ 
+diff --git a/risc0/zkp/src/lib.rs b/risc0/zkp/src/lib.rs
+index de0ffeb..5ea4dc4 100644
+--- a/risc0/zkp/src/lib.rs
++++ b/risc0/zkp/src/lib.rs
+@@ -52,3 +52,99 @@ pub const FRI_FOLD: usize = 1 << FRI_FOLD_PO2;
+ 
+ /// FRI continues until the degree of the FRI polynomial reaches FRI_MIN_DEGREE
+ const FRI_MIN_DEGREE: usize = 256;
++
++/// Number of pieces the check (quotient) polynomial is split into. The constraints have degree 5, so the
++/// quotient has degree < 4 * cycles at any blowup; stock RISC Zero ties this to INV_RATE (= 4).
++pub const CHECK_PIECES: usize = 4;
++
++/// GSR research: FRI parameters set per proof, process-wide.
++///
++/// The stock constants above are the defaults. `scoped` changes them for the proof (or verification) run while
++/// the returned guard lives; proofs made under other parameters (segments, lift, join) are unaffected as long as
++/// they do not run concurrently with the guard.
++pub mod fri_params {
++    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
++
++    /// The parameters of one proof.
++    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++    pub struct FriParams {
++        /// FRI queries.
++        pub queries: usize,
++        /// log2 of the inverse Reed-Solomon rate.
++        pub log_inv_rate: usize,
++        /// Proof-of-work bits ground before the query phase (0: none, as stock).
++        pub pow_bits: usize,
++        /// log2 of the Merkle cap (top layer) of every tree; 0 keeps the stock rule (largest 2^i <= queries).
++        pub cap_log: usize,
++    }
++
++    /// RISC Zero v3.0.6.
++    pub const STOCK: FriParams = FriParams {
++        queries: super::QUERIES,
++        log_inv_rate: 2,
++        pow_bits: 0,
++        cap_log: 0,
++    };
++
++    static CELLS: [AtomicUsize; 4] = [
++        AtomicUsize::new(STOCK.queries),
++        AtomicUsize::new(STOCK.log_inv_rate),
++        AtomicUsize::new(STOCK.pow_bits),
++        AtomicUsize::new(STOCK.cap_log),
++    ];
++
++    /// The parameters in force.
++    pub fn get() -> FriParams {
++        FriParams {
++            queries: CELLS[0].load(Relaxed),
++            log_inv_rate: CELLS[1].load(Relaxed),
++            pow_bits: CELLS[2].load(Relaxed),
++            cap_log: CELLS[3].load(Relaxed),
++        }
++    }
++
++    /// Put `p` in force; returns the previous parameters.
++    pub fn set(p: FriParams) -> FriParams {
++        assert!(p.log_inv_rate >= 2, "the check polynomial needs INV_RATE >= {}", super::CHECK_PIECES);
++        assert!(p.queries > 0 && p.pow_bits < 32);
++        let prev = get();
++        for (cell, v) in CELLS.iter().zip([p.queries, p.log_inv_rate, p.pow_bits, p.cap_log]) {
++            cell.store(v, Relaxed);
++        }
++        prev
++    }
++
++    /// Restores the previous parameters on drop.
++    pub struct Guard(FriParams);
++
++    impl Drop for Guard {
++        fn drop(&mut self) {
++            set(self.0);
++        }
++    }
++
++    /// Put `p` in force until the guard drops.
++    pub fn scoped(p: FriParams) -> Guard {
++        Guard(set(p))
++    }
++}
++
++pub(crate) fn queries() -> usize {
++    fri_params::get().queries
++}
++
++/// The inverse rate in force (see [fri_params]).
++pub fn inv_rate() -> usize {
++    1 << fri_params::get().log_inv_rate
++}
++
++pub(crate) fn pow_bits() -> usize {
++    fri_params::get().pow_bits
++}
++
++/// The proof-of-work nonce as the digest mixed into the transcript: the nonce in word 0, zeros elsewhere.
++pub(crate) fn pow_digest(nonce: u32) -> core::digest::Digest {
++    let mut words = [0u32; core::digest::DIGEST_WORDS];
++    words[0] = nonce;
++    core::digest::Digest::from(words)
++}
+diff --git a/risc0/zkp/src/merkle.rs b/risc0/zkp/src/merkle.rs
+index 2848523..490d8fe 100644
+--- a/risc0/zkp/src/merkle.rs
++++ b/risc0/zkp/src/merkle.rs
+@@ -52,6 +52,10 @@ impl MerkleTreeParams {
+             }
+             top_layer = i;
+         }
++        let cap_log = crate::fri_params::get().cap_log;
++        if cap_log > 0 {
++            top_layer = cap_log.min(layers.saturating_sub(1));
++        }
+         let top_size = 1 << top_layer;
+         MerkleTreeParams {
+             row_size,
+diff --git a/risc0/zkp/src/prove/fri.rs b/risc0/zkp/src/prove/fri.rs
+index c48b3de..0e15a6e 100644
+--- a/risc0/zkp/src/prove/fri.rs
++++ b/risc0/zkp/src/prove/fri.rs
+@@ -20,8 +20,9 @@ use tracing::debug;
+ use crate::{
+     core::log2_ceil,
+     hal::{Buffer, Hal},
++    inv_rate, pow_bits, pow_digest,
+     prove::{merkle::MerkleTreeProver, write_iop::WriteIOP},
+-    FRI_FOLD, FRI_MIN_DEGREE, INV_RATE, QUERIES,
++    queries, FRI_FOLD, FRI_MIN_DEGREE,
+ };
+ 
+ struct ProveRoundInfo<H: Hal> {
+@@ -42,21 +43,21 @@ impl<H: Hal> ProveRoundInfo<H> {
+         // Get the number of coefficients of the polynomial over the extension field.
+         let size = coeffs.size() / ext_size;
+         // Get a larger domain to interpolate over.
+-        let domain = size * INV_RATE;
++        let domain = size * inv_rate();
+         // Allocate space in which to put the interpolated values.
+         let evaluated = hal.alloc_elem("evaluated", domain * ext_size);
+         // Put in the coefficients, padding out with zeros so that we are left with the
+         // same polynomial represented by a larger coefficient list
+         // Evaluate the NTT in-place, filling the buffer with the evaluations of the
+         // polynomial.
+-        hal.batch_expand_into_evaluate_ntt(&evaluated, coeffs, ext_size, log2_ceil(INV_RATE));
++        hal.batch_expand_into_evaluate_ntt(&evaluated, coeffs, ext_size, log2_ceil(inv_rate()));
+         // Compute a Merkle tree committing to the polynomial evaluations.
+         let merkle = MerkleTreeProver::new(
+             hal,
+             &evaluated,
+             domain / FRI_FOLD,
+             FRI_FOLD * ext_size,
+-            QUERIES,
++            queries(),
+         );
+         // Send the merkle tree (as a commitment) to the virtual IOP verifier
+         merkle.commit(iop);
+@@ -93,7 +94,7 @@ pub fn fri_prove<H: Hal, F>(
+ {
+     scope!("fri_prove");
+     let ext_size = H::ExtElem::EXT_SIZE;
+-    let orig_domain = coeffs.size() / ext_size * INV_RATE;
++    let orig_domain = coeffs.size() / ext_size * inv_rate();
+     let mut rounds = Vec::new();
+     let mut coeffs = coeffs.clone();
+     while coeffs.size() / ext_size > FRI_MIN_DEGREE {
+@@ -111,9 +112,25 @@ pub fn fri_prove<H: Hal, F>(
+         let digest = hal.get_hash_suite().hashfn.hash_elem_slice(view);
+         iop.commit(&digest);
+     });
++    // Proof of work: find a nonce whose mix leaves the next word's low pow_bits zero.
++    let bits = pow_bits();
++    if bits > 0 {
++        scope!("grind");
++        let nonce = iop
++            .rng
++            .grind(bits)
++            .expect("this hash suite does not support proof of work");
++        iop.write_u32_slice(&[nonce]);
++        iop.commit(&pow_digest(nonce));
++        assert_eq!(
++            iop.random_bits(bits),
++            0,
++            "proof-of-work nonce does not meet the target"
++        );
++    }
+     // Do queries
+     debug!("Doing Queries");
+-    for _ in 0..QUERIES {
++    for _ in 0..queries() {
+         // Get a 'random' index.
+         let mut pos = iop.random_bits(log2_ceil(orig_domain)) as usize;
+         // Do the 'inner' proof for this index
+diff --git a/risc0/zkp/src/prove/poly_group.rs b/risc0/zkp/src/prove/poly_group.rs
+index 9d28aea..f854443 100644
+--- a/risc0/zkp/src/prove/poly_group.rs
++++ b/risc0/zkp/src/prove/poly_group.rs
+@@ -17,8 +17,9 @@ use risc0_core::scope_with;
+ use crate::{
+     core::log2_ceil,
+     hal::{Buffer, Hal},
++    inv_rate,
+     prove::merkle::MerkleTreeProver,
+-    INV_RATE, QUERIES,
++    queries,
+ };
+ 
+ /// A PolyGroup represents a group of polynomials, all of the same maximum
+@@ -69,11 +70,11 @@ impl<H: Hal> PolyGroup<H> {
+     ) -> Self {
+         scope_with!("poly_group({})", name);
+         assert_eq!(coeffs.size(), count * size);
+-        let domain = size * INV_RATE;
++        let domain = size * inv_rate();
+         let evaluated = hal.alloc_elem("evaluated", count * domain);
+-        hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(INV_RATE));
++        hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(inv_rate()));
+         hal.batch_bit_reverse(&coeffs, count);
+-        let merkle = MerkleTreeProver::new(hal, &evaluated, domain, count, QUERIES);
++        let merkle = MerkleTreeProver::new(hal, &evaluated, domain, count, queries());
+         PolyGroup {
+             coeffs,
+             count,
+diff --git a/risc0/zkp/src/prove/prover.rs b/risc0/zkp/src/prove/prover.rs
+index 1fbf29d..505cb9d 100644
+--- a/risc0/zkp/src/prove/prover.rs
++++ b/risc0/zkp/src/prove/prover.rs
+@@ -22,7 +22,6 @@ use crate::{
+     hal::{Buffer, CircuitHal, Hal},
+     prove::{fri::fri_prove, poly_group::PolyGroup, write_iop::WriteIOP},
+     taps::TapSet,
+-    INV_RATE,
+ };
+ 
+ /// Object to generate a zero-knowledge proof of the execution of some circuit.
+@@ -117,7 +116,7 @@ impl<'a, H: Hal> Prover<'a, H> {
+         // Set the poly mix value, which is used for constraint compression in the
+         // DEEP-ALI protocol.
+         let poly_mix = self.iop.random_ext_elem();
+-        let domain = self.cycles * INV_RATE;
++        let domain = self.cycles * crate::inv_rate();
+         let ext_size = H::ExtElem::EXT_SIZE;
+ 
+         // Now generate the check polynomial.
+@@ -163,6 +162,36 @@ impl<'a, H: Hal> Prover<'a, H> {
+         // purposes of interpolate/evaluate.
+         self.hal.batch_interpolate_ntt(&check_poly, ext_size);
+ 
++        // At INV_RATE > CHECK_PIECES the check polynomial still has degree < CHECK_PIECES * cycles. Its
++        // bit-reversed coefficients of index >= CHECK_PIECES * cycles sit at the positions that are not multiples
++        // of INV_RATE / CHECK_PIECES, so keeping every (INV_RATE / CHECK_PIECES)-th one gives the bit-reversed
++        // coefficients of the same polynomial over CHECK_PIECES * cycles, the layout of the stock INV_RATE = 4.
++        let check_poly = if crate::inv_rate() > crate::CHECK_PIECES {
++            let stride = crate::inv_rate() / crate::CHECK_PIECES;
++            let size = crate::CHECK_PIECES * self.cycles;
++            let pieces = self.hal.alloc_elem("check_pieces", ext_size * size);
++            check_poly.view(|src| {
++                pieces.view_mut(|dst| {
++                    for c in 0..ext_size {
++                        for i in 0..domain {
++                            let v = src[c * domain + i];
++                            if i % stride == 0 {
++                                dst[c * size + i / stride] = v;
++                            } else {
++                                assert!(
++                                    v == H::Elem::ZERO,
++                                    "check polynomial degree >= CHECK_PIECES * cycles"
++                                );
++                            }
++                        }
++                    }
++                })
++            });
++            pieces
++        } else {
++            check_poly
++        };
++
+         // The next step is to convert the degree 4*n check polynomial into 4 degree n
+         // polynomials so that f(x) = g0(x^4) + g1(x^4) x + g2(x^4) x^2 + g3(x^4)
+         // x^3.  To do this, we normally would grab all the coefficients of f(x) =
+diff --git a/risc0/zkp/src/verify/fri.rs b/risc0/zkp/src/verify/fri.rs
+index b429885..5967bab 100644
+--- a/risc0/zkp/src/verify/fri.rs
++++ b/risc0/zkp/src/verify/fri.rs
+@@ -24,8 +24,9 @@ use crate::{
+         log2_ceil,
+         ntt::{bit_reverse, interpolate_ntt},
+     },
++    inv_rate, pow_bits, pow_digest, queries,
+     verify::{merkle::MerkleTreeVerifier, read_iop::ReadIOP, VerificationError},
+-    FRI_FOLD, FRI_FOLD_PO2, FRI_MIN_DEGREE, INV_RATE, QUERIES,
++    FRI_FOLD, FRI_FOLD_PO2, FRI_MIN_DEGREE,
+ };
+ 
+ /// VerifyRoundInfo contains the data against which the queries for a particular
+@@ -51,7 +52,7 @@ impl<'a, F: Field> VerifyRoundInfo<'a, F> {
+                 hashfn,
+                 domain,
+                 FRI_FOLD * F::ExtElem::EXT_SIZE,
+-                QUERIES,
++                queries(),
+             )?,
+             mix: iop.random_ext_elem(),
+         })
+@@ -104,7 +105,7 @@ where
+     {
+         let mut degree: usize = self.tot_cycles;
+         let hashfn = self.suite.hashfn.as_ref();
+-        let orig_domain = INV_RATE * degree;
++        let orig_domain = inv_rate() * degree;
+         let mut domain = orig_domain;
+         // Prep the folding verifiers
+         let rounds_capacity = log2_ceil(degree.div_ceil(FRI_FOLD).div_ceil(FRI_FOLD_PO2));
+@@ -136,11 +137,20 @@ where
+             gsr_trace_elems("round_mix", &[round.mix]);
+         }
+         self.iop().commit(&final_digest);
++        // Proof of work: the nonce mixed into the transcript must leave the next word's low pow_bits zero.
++        let bits = pow_bits();
++        if bits > 0 {
++            let nonce = self.iop().read_u32s(1)?[0];
++            self.iop().commit(&pow_digest(nonce));
++            if self.iop().random_bits(bits) != 0 {
++                return Err(VerificationError::InvalidProof);
++            }
++        }
+         // Get the generator for the final polynomial evaluations
+         let gen = <F::Elem as RootsOfUnity>::ROU_FWD[log2_ceil(domain)];
+         // Do queries
+         let mut poly_buf: Vec<F::ExtElem> = Vec::with_capacity(degree);
+-        for _ in 0..QUERIES {
++        for _ in 0..queries() {
+             let mut pos = self.iop().random_bits(log2_ceil(orig_domain)) as usize;
+             // Do the 'inner' verification for this index
+             gsr_trace("pos", &[pos as u32]);
+diff --git a/risc0/zkp/src/verify/mod.rs b/risc0/zkp/src/verify/mod.rs
+index 5659096..eb11300 100644
+--- a/risc0/zkp/src/verify/mod.rs
++++ b/risc0/zkp/src/verify/mod.rs
+@@ -37,7 +37,7 @@ use crate::{
+     },
+     core::{digest::Digest, hash::HashSuite, log2_ceil},
+     taps::TapSet,
+-    INV_RATE, MAX_CYCLES_PO2, QUERIES,
++    MAX_CYCLES_PO2,
+ };
+ 
+ // If true, enable tracing of verifier internals.
+@@ -158,7 +158,7 @@ impl fmt::Display for VerificationError {
+ impl std::error::Error for VerificationError {}
+ 
+ trait VerifyParams<F: Field> {
+-    const CHECK_SIZE: usize = INV_RATE * F::ExtElem::EXT_SIZE;
++    const CHECK_SIZE: usize = crate::CHECK_PIECES * F::ExtElem::EXT_SIZE;
+ }
+ 
+ #[stability::unstable]
+@@ -225,11 +225,16 @@ impl<'a, F: Field> Verifier<'a, F> {
+             return Err(VerificationError::ReceiptFormatError);
+         }
+         let group_size = self.taps.group_size(reg_group_id);
+-        let domain = INV_RATE * self.tot_cycles;
++        let domain = crate::inv_rate() * self.tot_cycles;
+         let hashfn = self.suite.hashfn.as_ref();
+ 
+-        let merkle =
+-            MerkleTreeVerifier::new(self.iop().deref_mut(), hashfn, domain, group_size, QUERIES)?;
++        let merkle = MerkleTreeVerifier::new(
++            self.iop().deref_mut(),
++            hashfn,
++            domain,
++            group_size,
++            crate::queries(),
++        )?;
+         self.merkle_verifiers[reg_group_id] = Some(merkle);
+         let root = self.merkle_verifiers[reg_group_id].as_ref().unwrap().root();
+         gsr_trace(self.taps.group_name(reg_group_id), root.as_words());
+@@ -287,7 +292,7 @@ impl<'a, F: Field> Verifier<'a, F> {
+             ret += num * divisor.inv();
+         }
+         let check_num = tot[combo_count] - combo_u[self.taps.tot_combo_backs];
+-        let check_div = x - z.pow(INV_RATE);
++        let check_div = x - z.pow(crate::CHECK_PIECES);
+         ret += check_num * check_div.inv();
+         ret
+     }
+@@ -318,13 +323,13 @@ impl<'a, F: Field> Verifier<'a, F> {
+         trace_if_enabled!("Poly mix: {poly_mix:?}");
+ 
+         let hashfn = self.suite.hashfn.as_ref();
+-        let domain = INV_RATE * self.tot_cycles;
++        let domain = crate::inv_rate() * self.tot_cycles;
+         let check_merkle = MerkleTreeVerifier::new(
+             self.iop().deref_mut(),
+             hashfn,
+             domain,
+             Self::CHECK_SIZE,
+-            QUERIES,
++            crate::queries(),
+         )?;
+         trace_if_enabled!("Check merkle root: {}", check_merkle.root());
+         gsr_trace("check", check_merkle.root().as_words());
+diff --git a/risc0/zkvm/src/host/recursion/mod.rs b/risc0/zkvm/src/host/recursion/mod.rs
+index ff75474..fe3a755 100644
+--- a/risc0/zkvm/src/host/recursion/mod.rs
++++ b/risc0/zkvm/src/host/recursion/mod.rs
+@@ -36,7 +36,8 @@ pub use risc0_circuit_recursion::control_id::{ALLOWED_CONTROL_IDS, ALLOWED_CONTR
+ pub use self::prove::test_zkr;
+ #[cfg(feature = "prove")]
+ pub use self::prove::{
+-    identity_p254, identity_sha256_padded, join, lift, resolve, Prover, RECURSION_PO2,
++    identity_p254, identity_sha256_padded, identity_sha256_padded_with, join, lift, resolve, Prover,
++    RECURSION_PO2,
+ };
+ #[cfg(feature = "prove")]
+ pub use risc0_circuit_recursion::prove::Program;
+diff --git a/risc0/zkvm/src/host/recursion/prove/mod.rs b/risc0/zkvm/src/host/recursion/prove/mod.rs
+index c5f8272..534e8ec 100644
+--- a/risc0/zkvm/src/host/recursion/prove/mod.rs
++++ b/risc0/zkvm/src/host/recursion/prove/mod.rs
+@@ -396,9 +396,21 @@ pub fn identity_p254(
+ pub fn identity_sha256_padded(
+     inner: &SuccinctReceipt<ReceiptClaim>,
+ ) -> Result<(SuccinctReceipt<ReceiptClaim>, SuccinctReceiptVerifierParameters)> {
+-    let (_, control_id) = zkr::identity("sha-256-padded")?;
++    identity_sha256_padded_with(inner, "sha-256-padded", risc0_zkp::fri_params::STOCK)
++}
++
++/// [identity_sha256_padded] under the hash suite `hashfn` (`sha-256-padded` or `sha-256-padded-t26`) and the
++/// FRI parameters `params`, which are in force for this proof only (control ID and proof). Verify the result with
++/// the same parameters in force ([risc0_zkp::fri_params::scoped]).
++pub fn identity_sha256_padded_with(
++    inner: &SuccinctReceipt<ReceiptClaim>,
++    hashfn: &str,
++    params: risc0_zkp::fri_params::FriParams,
++) -> Result<(SuccinctReceipt<ReceiptClaim>, SuccinctReceiptVerifierParameters)> {
++    let _params = risc0_zkp::fri_params::scoped(params);
++    let (_, control_id) = zkr::identity(hashfn)?;
+     let opts = ProverOpts::succinct()
+-        .with_hashfn("sha-256-padded".to_string())
++        .with_hashfn(hashfn.to_string())
+         .with_control_ids(vec![control_id]);
+     let mut prover = Prover::new_identity(inner, opts)?;
+     let receipt = prover.prover.run()?;
+diff --git a/risc0/zkvm/src/host/recursion/prove/zkr.rs b/risc0/zkvm/src/host/recursion/prove/zkr.rs
+index eff5bc6..30bc91b 100644
+--- a/risc0/zkvm/src/host/recursion/prove/zkr.rs
++++ b/risc0/zkvm/src/host/recursion/prove/zkr.rs
+@@ -20,7 +20,10 @@ use risc0_circuit_recursion::{
+ use risc0_zkp::{
+     core::{
+         digest::Digest,
+-        hash::{hash_suite_from_name, sha_padded::SHA256_PADDED},
++        hash::{
++            hash_suite_from_name,
++            sha_padded::{SHA256_PADDED, SHA256_PADDED_T26},
++        },
+     },
+     MAX_CYCLES_PO2, MIN_CYCLES_PO2,
+ };
+@@ -30,7 +33,7 @@ use crate::RECURSION_PO2;
+ fn get_zkr(name: &str, hashfn: &str) -> Result<(Program, Digest)> {
+     // The padded SHA-256 suite has no bootstrapped control ID table, so derive the ID from the
+     // program itself. This is the same computation `cargo xtask bootstrap` runs to fill the tables.
+-    if hashfn == SHA256_PADDED {
++    if hashfn == SHA256_PADDED || hashfn == SHA256_PADDED_T26 {
+         let program = risc0_circuit_recursion::prove::zkr::get_zkr(name, RECURSION_PO2)?;
+         let suite = hash_suite_from_name(hashfn)
+             .ok_or_else(|| anyhow!("unsupported hash function: {hashfn}"))?;
+diff --git a/risc0/zkvm/src/host/recursion/tests.rs b/risc0/zkvm/src/host/recursion/tests.rs
+index da8b44f..9cc2a54 100644
+--- a/risc0/zkvm/src/host/recursion/tests.rs
++++ b/risc0/zkvm/src/host/recursion/tests.rs
+@@ -927,3 +927,57 @@ fn gsr_covenant_rejects_nonminimal_compact_size() {
+     assert!(run(&[0xfe, 0x22, 0x00, 0x00, 0x00]).is_err());
+     assert!(run(&[0xff, 0x22, 0, 0, 0, 0, 0, 0, 0]).is_err());
+ }
++
++/// Re-prove the busy-loop receipt of `gsr_measure` with its final padded proof under the hash suite and FRI
++/// parameters in the JSON object `GSR_FRI_PARAMS` (`{"hashfn": "sha-256-padded-t26", "queries": 18,
++/// "log_inv_rate": 4, ...}`; missing fields take the stock values), verify it natively under those parameters
++/// and not under the stock ones, and write `receipt.json` / `seal.bin` to `R0_GSR_SEAL_DIR`.
++#[test]
++#[ignore]
++fn gsr_fri_params_prove() {
++    use risc0_zkp::fri_params::{self, FriParams};
++
++    let spec: serde_json::Value =
++        serde_json::from_str(&std::env::var("GSR_FRI_PARAMS").unwrap()).unwrap();
++    let stock = fri_params::STOCK;
++    let get = |k: &str, d: usize| spec.get(k).and_then(|v| v.as_u64()).map_or(d, |v| v as usize);
++    let fri = FriParams {
++        queries: get("queries", stock.queries),
++        log_inv_rate: get("log_inv_rate", stock.log_inv_rate),
++        pow_bits: get("pow_bits", stock.pow_bits),
++        cap_log: get("cap_log", stock.cap_log),
++    };
++    let hashfn = spec
++        .get("hashfn")
++        .and_then(|v| v.as_str())
++        .unwrap_or("sha-256-padded");
++
++    let (journal, segments) = BUSY_LOOP_SEGMENTS.clone();
++    let mut compressed = lift(&segments[0]).unwrap();
++    for receipt in &segments[1..] {
++        compressed = join(&compressed, &lift(receipt).unwrap()).unwrap();
++    }
++    let (receipt, params) = super::identity_sha256_padded_with(&compressed, hashfn, fri).unwrap();
++
++    let ctx = VerifierContext::empty()
++        .with_suites(VerifierContext::default_hash_suites())
++        .with_succinct_verifier_parameters(params.clone());
++    {
++        let _fri = fri_params::scoped(fri);
++        receipt.verify_integrity_with_context(&ctx).unwrap();
++    }
++    assert!(fri == stock || receipt.verify_integrity_with_context(&ctx).is_err());
++
++    let dir = std::env::var("R0_GSR_SEAL_DIR").unwrap();
++    std::fs::write(
++        format!("{dir}/seal.bin"),
++        bytemuck::cast_slice::<u32, u8>(&receipt.seal),
++    )
++    .unwrap();
++    std::fs::write(
++        format!("{dir}/receipt.json"),
++        serde_json::to_string_pretty(&gsr_receipt_json(&receipt, &params, &journal.bytes)).unwrap(),
++    )
++    .unwrap();
++    println!("claim : {}", receipt.claim.digest());
++}
+diff --git a/risc0/zkvm/src/receipt.rs b/risc0/zkvm/src/receipt.rs
+index dd233d7..97682cc 100644
+--- a/risc0/zkvm/src/receipt.rs
++++ b/risc0/zkvm/src/receipt.rs
+@@ -31,7 +31,9 @@ use risc0_zkp::{
+         digest::Digest,
+         hash::{
+             blake2b::Blake2bCpuHashSuite, poseidon2::Poseidon2HashSuite, sha::Sha256HashSuite,
+-            sha_padded::{PaddedSha256HashSuite, SHA256_PADDED},
++            sha_padded::{
++                PaddedSha256HashSuite, TruncatedSha256HashSuite, SHA256_PADDED, SHA256_PADDED_T26,
++            },
+             HashSuite,
+         },
+     },
+@@ -937,6 +939,7 @@ impl VerifierContext {
+             ("poseidon2".into(), Poseidon2HashSuite::new_suite()),
+             ("sha-256".into(), Sha256HashSuite::new_suite()),
+             (SHA256_PADDED.into(), PaddedSha256HashSuite::new_suite()),
++            (SHA256_PADDED_T26.into(), TruncatedSha256HashSuite::new_suite()),
+         ])
+     }
+ 

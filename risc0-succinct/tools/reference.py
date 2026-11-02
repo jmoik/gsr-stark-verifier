@@ -8,6 +8,7 @@ checked against it phase by phase, and acceptance is differentially tested again
 """
 import hashlib
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -17,12 +18,22 @@ from babybear import P
 
 ROOT = Path(__file__).resolve().parents[1]
 PROOF_SYSTEM_INFO = b"RISC0_STARK:v1__"
-QUERIES = 50
-INV_RATE = 4
+# Hash suite and FRI parameters of the final proof: RISC Zero's, or those set in the JSON object GSR_FRI_PARAMS
+# (as for the patch's gsr_fri_params_prove), e.g. {"hashfn": "sha-256-padded-t26", "queries": 18,
+# "log_inv_rate": 4, "pow_bits": 28, "cap_log": 5}.
+_FRI = json.loads(os.environ.get("GSR_FRI_PARAMS") or "{}")
+HASHFN = _FRI.get("hashfn", "sha-256-padded")
+D = {"sha-256-padded": 32, "sha-256-padded-t26": 26}[HASHFN]  # bytes kept of every commitment digest
+QUERIES = _FRI.get("queries", 50)
+LOG_INV_RATE = _FRI.get("log_inv_rate", 2)
+INV_RATE = 1 << LOG_INV_RATE
 FRI_FOLD = 16
 FRI_MIN_DEGREE = 256
+POW_BITS = _FRI.get("pow_bits", 0)
+CAP_LOG = _FRI.get("cap_log", 0)
 MAX_CYCLES_PO2 = 24
-CHECK_SIZE = INV_RATE * 4
+CHECK_PIECES = 4  # the check polynomial is split into 4 pieces at any inverse rate
+CHECK_SIZE = CHECK_PIECES * 4
 GROUP_ACCUM, GROUP_CODE, GROUP_DATA = 0, 1, 2
 
 
@@ -32,6 +43,16 @@ class VerifyError(Exception):
 
 def sha(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
+
+
+def H(data: bytes) -> bytes:
+    """The suite's commitment hash: SHA-256, truncated to D bytes (zero-padded to 32, as RISC Zero's Digest)."""
+    return sha(data)[:D] + bytes(32 - D)
+
+
+def H2(a: bytes, b: bytes) -> bytes:
+    """Merkle parent: the suite hashes the kept D bytes of each child."""
+    return H(a[:D] + b[:D])
 
 
 def words_bytes(words) -> bytes:
@@ -98,15 +119,36 @@ class ReadIOP:
             raise VerifyError("ReceiptFormatError")
 
 
-def top_size_for(row_size: int, queries: int = QUERIES) -> int:
+def top_layer(row_size: int, queries: int = QUERIES) -> int:
+    """log2 of a Merkle tree's top size: RISC Zero's rule, or CAP_LOG when set."""
     layers = row_size.bit_length() - 1
     assert 1 << layers == row_size
-    top_layer = 0
+    top = 0
     for i in range(1, layers):
         if (1 << i) > queries:
             break
-        top_layer = i
-    return 1 << top_layer
+        top = i
+    return min(CAP_LOG, layers - 1) if CAP_LOG else top
+
+
+def top_size_for(row_size: int, queries: int = QUERIES) -> int:
+    return 1 << top_layer(row_size, queries)
+
+
+# The proof's shape for the recursion circuit (po2 18) under these parameters
+PO2 = 18
+DOMAIN_PO2 = PO2 + LOG_INV_RATE
+TRACE_TOP = top_size_for(1 << DOMAIN_PO2)
+TRACE_LEVELS = DOMAIN_PO2 - TRACE_TOP.bit_length() + 1
+FRI_ROWS_PO2 = []  # log2 of the row count of each fold round's tree
+_degree = 1 << PO2
+while _degree > FRI_MIN_DEGREE:
+    _degree //= FRI_FOLD
+    FRI_ROWS_PO2.append((_degree * INV_RATE).bit_length() - 1)
+FINAL_DEGREE = _degree
+FRI_ROUNDS = len(FRI_ROWS_PO2)
+FRI_TOP = [top_size_for(1 << r) for r in FRI_ROWS_PO2]
+FRI_LEVELS = [r - t.bit_length() + 1 for r, t in zip(FRI_ROWS_PO2, FRI_TOP)]
 
 
 class MerkleVerifier:
@@ -118,9 +160,9 @@ class MerkleVerifier:
         self.rest: list = [None] * (self.top_size - 1)
         for i in reversed(range(self.top_size // 2, self.top_size)):
             t = 2 * i - self.top_size
-            self.rest[i - 1] = sha(self.top[t] + self.top[t + 1])
+            self.rest[i - 1] = H2(self.top[t], self.top[t + 1])
         for i in reversed(range(1, self.top_size // 2)):
-            self.rest[i - 1] = sha(self.rest[2 * i - 1] + self.rest[2 * i])
+            self.rest[i - 1] = H2(self.rest[2 * i - 1], self.rest[2 * i])
         self.root = self.rest[0] if self.rest else self.top[1 - self.top_size]
         iop.commit(self.root)
 
@@ -128,13 +170,13 @@ class MerkleVerifier:
         if idx >= self.row_size:
             raise VerifyError("MerkleQueryOutOfRange")
         out = iop.read_elems(self.col_size)
-        cur = sha(words_bytes(out))
+        cur = H(words_bytes(out))
         idx += self.row_size
         while idx >= 2 * self.top_size:
             low_bit = idx % 2
             other = words_bytes(iop.read_u32s(8))
             idx //= 2
-            cur = sha(other + cur) if low_bit else sha(cur + other)
+            cur = H2(other, cur) if low_bit else H2(cur, other)
         present = self.top[idx - self.top_size] if idx >= self.top_size else self.rest[idx - 1]
         if present != cur:
             raise VerifyError("InvalidProof")
@@ -213,13 +255,13 @@ def verify_seal(seal: list[int], trace: dict, check_code) -> list[int]:
     iop = ReadIOP(seal, trace)
 
     def info_hash(info: bytes) -> bytes:
-        return sha(words_bytes([bb.to_mont(b) for b in info] + [0] * (16 - len(info))))
+        return H(words_bytes([bb.to_mont(b) for b in info] + [0] * (16 - len(info))))
 
     iop.commit(info_hash(PROOF_SYSTEM_INFO))
     iop.commit(info_hash(circuit["circuit_info"].encode()))
 
     raw = iop.read_elems(circuit["output_size"] + 1)
-    iop.commit(sha(words_bytes(raw)))
+    iop.commit(H(words_bytes(raw)))
     out = [bb.from_mont(w) for w in raw[:-1]]
     po2 = raw[-1]  # to_u32_words of an Elem is its Montgomery word
     if po2 > MAX_CYCLES_PO2:
@@ -241,7 +283,7 @@ def verify_seal(seal: list[int], trace: dict, check_code) -> list[int]:
     z = iop.rng.random_ext()
     back_one = bb.ROU_REV[po2]
     coeff_raw = iop.read_elems(4 * (taps.num_taps + CHECK_SIZE))
-    iop.commit(sha(words_bytes(coeff_raw)))
+    iop.commit(H(words_bytes(coeff_raw)))
     coeff_u = [ext_from_words(coeff_raw[4 * i:4 * i + 4]) for i in range(taps.num_taps + CHECK_SIZE)]
 
     eval_u, cur_pos = [], 0
@@ -303,7 +345,7 @@ def verify_seal(seal: list[int], trace: dict, check_code) -> list[int]:
                 divisor = bb.mul(divisor, bb.sub(xe, bb.scale(z, pow(back_one, back, P))))
             ret = bb.add(ret, bb.mul(num, bb.inv(divisor)))
         check_num = bb.sub(tot[-1], combo_u[taps.tot_combo_backs])
-        check_div = bb.sub(xe, bb.power(z, INV_RATE))
+        check_div = bb.sub(xe, bb.power(z, CHECK_PIECES))
         return bb.add(ret, bb.mul(check_num, bb.inv(check_div)))
 
     # FRI
@@ -316,7 +358,12 @@ def verify_seal(seal: list[int], trace: dict, check_code) -> list[int]:
         rounds.append({"domain": domain, "merkle": merkle, "mix": iop.rng.random_ext()})
         degree //= FRI_FOLD
     final_raw = iop.read_elems(4 * degree)
-    iop.commit(sha(words_bytes(final_raw)))
+    iop.commit(H(words_bytes(final_raw)))
+    if POW_BITS:
+        nonce = iop.read_u32s(1)[0]
+        iop.commit(struct.pack("<I", nonce) + bytes(28))
+        if iop.rng.random_bits(POW_BITS) != 0:
+            raise VerifyError("InvalidProof")
     final_vals = [bb.from_mont(w) for w in final_raw]
     final_poly = [tuple(final_vals[j * degree + i] for j in range(4)) for i in range(degree)]
     fgen = bb.ROU_FWD[domain.bit_length() - 1]
@@ -356,7 +403,7 @@ def tagged_struct(tag: str, down: list[bytes], data: list[int]) -> bytes:
 def verify_receipt(receipt: dict, seal_bytes: bytes, trace: dict | None = None) -> None:
     """SuccinctReceipt::verify_integrity_with_context with fixed verifier parameters from `receipt`."""
     trace = {} if trace is None else trace
-    if receipt["hashfn"] != "sha-256-padded":
+    if receipt["hashfn"] != HASHFN:
         raise VerifyError("InvalidHashSuite")
     if receipt["proof_system_info"] != PROOF_SYSTEM_INFO.decode():
         raise VerifyError("ProofSystemInfoMismatch")
@@ -375,7 +422,7 @@ def verify_receipt(receipt: dict, seal_bytes: bytes, trace: dict | None = None) 
         cur, index = code_root, proof["index"]
         for sibling in proof["digests"]:
             s = bytes.fromhex(sibling)
-            cur = sha(cur + s) if index & 1 == 0 else sha(s + cur)
+            cur = H2(cur, s) if index & 1 == 0 else H2(s, cur)
             index >>= 1
         if cur != control_root:
             raise VerifyError("ControlVerificationError")
